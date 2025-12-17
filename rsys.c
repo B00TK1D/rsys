@@ -24,6 +24,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+
 #if !defined(__x86_64__)
 #error "rsys currently supports x86_64 only"
 #endif
@@ -48,6 +52,64 @@ struct fd_map_ent {
   int remote_fd;
 };
 
+struct remote_ref_ent {
+  int remote_fd;
+  uint32_t refs;
+};
+
+struct remote_refs {
+  struct remote_ref_ent *v;
+  size_t n;
+  size_t cap;
+};
+
+static void rrefs_init(struct remote_refs *r) {
+  r->v = NULL;
+  r->n = 0;
+  r->cap = 0;
+}
+
+static uint32_t rrefs_get(const struct remote_refs *r, int remote_fd) {
+  for (size_t i = 0; i < r->n; i++) {
+    if (r->v[i].remote_fd == remote_fd) return r->v[i].refs;
+  }
+  return 0;
+}
+
+static int rrefs_inc(struct remote_refs *r, int remote_fd) {
+  for (size_t i = 0; i < r->n; i++) {
+    if (r->v[i].remote_fd == remote_fd) {
+      r->v[i].refs++;
+      return 0;
+    }
+  }
+  if (r->n == r->cap) {
+    size_t ncap = r->cap ? (r->cap * 2) : 16;
+    void *nv = realloc(r->v, ncap * sizeof(*r->v));
+    if (!nv) return -1;
+    r->v = (struct remote_ref_ent *)nv;
+    r->cap = ncap;
+  }
+  r->v[r->n++] = (struct remote_ref_ent){.remote_fd = remote_fd, .refs = 1};
+  return 0;
+}
+
+// Returns the new refcount (0 means removed).
+static uint32_t rrefs_dec(struct remote_refs *r, int remote_fd) {
+  for (size_t i = 0; i < r->n; i++) {
+    if (r->v[i].remote_fd == remote_fd) {
+      if (r->v[i].refs > 1) {
+        r->v[i].refs--;
+        return r->v[i].refs;
+      }
+      r->v[i] = r->v[r->n - 1];
+      r->n--;
+      return 0;
+    }
+  }
+  return 0;
+}
+
 struct fd_map {
   struct fd_map_ent *v;
   size_t n;
@@ -69,7 +131,7 @@ static int fdmap_find_remote(const struct fd_map *m, int local_fd) {
   return -1;
 }
 
-static int fdmap_add(struct fd_map *m, int remote_fd) {
+static int fdmap_add_remote(struct fd_map *m, struct remote_refs *rrefs, int remote_fd) {
   if (m->n == m->cap) {
     size_t ncap = m->cap ? (m->cap * 2) : 16;
     struct fd_map_ent *nv = (struct fd_map_ent *)realloc(m->v, ncap * sizeof(*nv));
@@ -79,17 +141,49 @@ static int fdmap_add(struct fd_map *m, int remote_fd) {
   }
   int lfd = m->next_local++;
   m->v[m->n++] = (struct fd_map_ent){.local_fd = lfd, .remote_fd = remote_fd};
+  if (rrefs_inc(rrefs, remote_fd) < 0) {
+    // Roll back mapping on failure to track refs.
+    m->n--;
+    return -1;
+  }
   return lfd;
 }
 
-static void fdmap_del(struct fd_map *m, int local_fd) {
+static int fdmap_remove_local(struct fd_map *m, int local_fd, int *out_remote_fd) {
   for (size_t i = 0; i < m->n; i++) {
     if (m->v[i].local_fd == local_fd) {
+      if (out_remote_fd) *out_remote_fd = m->v[i].remote_fd;
       m->v[i] = m->v[m->n - 1];
       m->n--;
-      return;
+      return 0;
     }
   }
+  return -1;
+}
+
+static int fdmap_clone(struct fd_map *dst, const struct fd_map *src, struct remote_refs *rrefs) {
+  dst->v = NULL;
+  dst->n = 0;
+  dst->cap = 0;
+  dst->next_local = src->next_local;
+  if (src->n == 0) return 0;
+  dst->v = (struct fd_map_ent *)malloc(src->n * sizeof(*dst->v));
+  if (!dst->v) return -1;
+  dst->cap = src->n;
+  dst->n = src->n;
+  memcpy(dst->v, src->v, src->n * sizeof(*dst->v));
+  for (size_t i = 0; i < dst->n; i++) {
+    if (rrefs_inc(rrefs, dst->v[i].remote_fd) < 0) {
+      // Roll back ref increments already made.
+      for (size_t j = 0; j < i; j++) (void)rrefs_dec(rrefs, dst->v[j].remote_fd);
+      free(dst->v);
+      dst->v = NULL;
+      dst->n = 0;
+      dst->cap = 0;
+      return -1;
+    }
+  }
+  return 0;
 }
 
 static int connect_tcp(const char *host, const char *port_str) {
@@ -233,7 +327,7 @@ static int pending_add_out(struct pending_sys *p, uintptr_t addr, uint8_t *bytes
   return 0;
 }
 
-static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct fd_map *fm,
+static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct fd_map *fm, struct remote_refs *rrefs,
                              struct pending_sys *pend) {
   long nr = (long)regs->orig_rax;
 
@@ -291,7 +385,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
 
     int64_t rax = raw_sys_ret(rr, eno);
     if (rr >= 0) {
-      int local_fake = fdmap_add(fm, (int)rr);
+      int local_fake = fdmap_add_remote(fm, rrefs, (int)rr);
       if (local_fake < 0) {
         // best effort: close remote
         uint8_t creq[8];
@@ -327,29 +421,51 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int fd_remote = map_fd(fd_local);
     if (fd_remote < 0) return 0; // local close
 
-    vlog("[rsys] close(fd=%d -> remote_fd=%d)\n", fd_local, fd_remote);
+    uint32_t refs = rrefs_get(rrefs, fd_remote);
+    if (refs == 0) return 0; // inconsistent; fall back to local
 
+    // If this isn't the last reference, we can emulate close(2) locally by removing the mapping for this process only.
+    if (refs > 1) {
+      int removed_remote = -1;
+      if (fdmap_remove_local(fm, fd_local, &removed_remote) < 0) return 0;
+      (void)rrefs_dec(rrefs, removed_remote);
+
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->set_rax = 0;
+      pend->close_local_fd = -1;
+      return 1;
+    }
+
+    // Last reference: close on remote, and only remove mapping if that succeeds.
+    vlog("[rsys] close(fd=%d -> remote_fd=%d) -> remote\n", fd_local, fd_remote);
     uint8_t req[8];
     rsys_put_s64(req + 0, (int64_t)fd_remote);
-
     struct rsys_resp resp;
     uint8_t *data = NULL;
     uint32_t data_len = 0;
     if (rsys_call(sock, RSYS_REQ_CLOSE, req, sizeof(req), &resp, &data, &data_len) < 0) return 0;
     free(data);
-
-    int64_t rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
-
-    vlog("[rsys] close -> rax=%" PRId64 "\n", rax);
+    int64_t rr_ret = rsys_resp_raw_ret(&resp);
+    int32_t eno = rsys_resp_err_no(&resp);
+    int64_t rax = raw_sys_ret(rr_ret, eno);
+    if (rr_ret == 0) {
+      int removed_remote = -1;
+      if (fdmap_remove_local(fm, fd_local, &removed_remote) == 0) {
+        (void)rrefs_dec(rrefs, removed_remote);
+      }
+    }
 
     regs->orig_rax = __NR_getpid;
     if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
     pend->set_rax = rax;
-    pend->close_local_fd = (rax == 0) ? fd_local : -1;
+    pend->close_local_fd = -1;
     return 1;
   }
 
@@ -1070,7 +1186,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int32_t eno = rsys_resp_err_no(&resp);
     int64_t rax = raw_sys_ret(rr, eno);
     if (rr >= 0) {
-      int local_fake = fdmap_add(fm, (int)rr);
+      int local_fake = fdmap_add_remote(fm, rrefs, (int)rr);
       if (local_fake < 0) {
         // best-effort close remote
         uint8_t creq[8];
@@ -1134,8 +1250,8 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
         int64_t rfd0 = rsys_get_s64(data + 0);
         int64_t rfd1 = rsys_get_s64(data + 8);
         free(data);
-        int lfd0 = fdmap_add(fm, (int)rfd0);
-        int lfd1 = fdmap_add(fm, (int)rfd1);
+        int lfd0 = fdmap_add_remote(fm, rrefs, (int)rfd0);
+        int lfd1 = fdmap_add_remote(fm, rrefs, (int)rfd1);
         if (lfd0 < 0 || lfd1 < 0) {
           pend->set_rax = -ENOMEM;
         } else {
@@ -1313,7 +1429,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int32_t eno = rsys_resp_err_no(&resp);
     int64_t rax = raw_sys_ret(rr, eno);
     if (rr >= 0) {
-      int local_fake = fdmap_add(fm, (int)rr);
+      int local_fake = fdmap_add_remote(fm, rrefs, (int)rr);
       if (local_fake < 0) {
         rax = -ENOMEM;
       } else {
@@ -2088,7 +2204,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int32_t eno = rsys_resp_err_no(&resp);
     int64_t rax = raw_sys_ret(rr, eno);
     if (rr >= 0) {
-      int local_fake = fdmap_add(fm, (int)rr);
+      int local_fake = fdmap_add_remote(fm, rrefs, (int)rr);
       if (local_fake < 0) rax = -ENOMEM;
       else rax = local_fake;
     }
@@ -2512,6 +2628,105 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
   return 0;
 }
 
+struct fd_table {
+  struct fd_map map;
+  uint32_t refs;
+};
+
+static void remote_close_best_effort(int sock, int remote_fd) {
+  uint8_t req[8];
+  rsys_put_s64(req + 0, (int64_t)remote_fd);
+  struct rsys_resp resp;
+  uint8_t *data = NULL;
+  uint32_t data_len = 0;
+  if (rsys_call(sock, RSYS_REQ_CLOSE, req, sizeof(req), &resp, &data, &data_len) < 0) return;
+  free(data);
+}
+
+static struct fd_table *fdtable_new(void) {
+  struct fd_table *t = (struct fd_table *)calloc(1, sizeof(*t));
+  if (!t) return NULL;
+  fdmap_init(&t->map);
+  t->refs = 1;
+  return t;
+}
+
+static struct fd_table *fdtable_fork_clone(const struct fd_table *parent, struct remote_refs *rrefs) {
+  struct fd_table *t = (struct fd_table *)calloc(1, sizeof(*t));
+  if (!t) return NULL;
+  t->refs = 1;
+  if (fdmap_clone(&t->map, &parent->map, rrefs) < 0) {
+    free(t);
+    return NULL;
+  }
+  return t;
+}
+
+static void fdtable_ref(struct fd_table *t) { t->refs++; }
+
+static void fdtable_unref(struct fd_table *t, int sock, struct remote_refs *rrefs) {
+  if (!t) return;
+  if (--t->refs != 0) return;
+  for (size_t i = 0; i < t->map.n; i++) {
+    int rfd = t->map.v[i].remote_fd;
+    if (rrefs_dec(rrefs, rfd) == 0) remote_close_best_effort(sock, rfd);
+  }
+  free(t->map.v);
+  free(t);
+}
+
+struct proc_state {
+  pid_t pid;
+  int in_syscall;
+  int sig_to_deliver;
+  struct pending_sys pend;
+  struct fd_table *fdt;
+};
+
+struct proc_tab {
+  struct proc_state *v;
+  size_t n;
+  size_t cap;
+};
+
+static struct proc_state *proctab_find(struct proc_tab *t, pid_t pid) {
+  for (size_t i = 0; i < t->n; i++) {
+    if (t->v[i].pid == pid) return &t->v[i];
+  }
+  return NULL;
+}
+
+static struct proc_state *proctab_add(struct proc_tab *t, pid_t pid, struct fd_table *fdt) {
+  if (t->n == t->cap) {
+    size_t ncap = t->cap ? (t->cap * 2) : 8;
+    void *nv = realloc(t->v, ncap * sizeof(*t->v));
+    if (!nv) return NULL;
+    t->v = (struct proc_state *)nv;
+    t->cap = ncap;
+  }
+  struct proc_state *ps = &t->v[t->n++];
+  memset(ps, 0, sizeof(*ps));
+  ps->pid = pid;
+  ps->in_syscall = 0;
+  ps->sig_to_deliver = 0;
+  ps->pend.outs = NULL;
+  pending_clear(&ps->pend);
+  ps->fdt = fdt;
+  return ps;
+}
+
+static void proctab_del(struct proc_tab *t, pid_t pid, int sock, struct remote_refs *rrefs) {
+  for (size_t i = 0; i < t->n; i++) {
+    if (t->v[i].pid == pid) {
+      pending_clear(&t->v[i].pend);
+      fdtable_unref(t->v[i].fdt, sock, rrefs);
+      t->v[i] = t->v[t->n - 1];
+      t->n--;
+      return;
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   int argi = 1;
   if (argc > 1 && strcmp(argv[1], "-v") == 0) {
@@ -2548,67 +2763,106 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  long opts = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL;
+  // Note: We intentionally do NOT enable PTRACE_O_TRACEEXEC here.
+  // With PTRACE_SYSCALL, the extra exec event stop can desynchronize a simple
+  // entry/exit syscall-stop state machine. Fork/clone/vfork are sufficient to
+  // keep tracing descendants spawned by shells.
+  long opts =
+      PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE;
   if (ptrace(PTRACE_SETOPTIONS, child, 0, (void *)opts) < 0) die("PTRACE_SETOPTIONS");
 
-  struct fd_map fm;
-  fdmap_init(&fm);
+  struct remote_refs rr;
+  rrefs_init(&rr);
 
-  struct pending_sys pend = {0};
-  pend.outs = NULL;
-  pending_clear(&pend);
+  struct fd_table *root_fdt = fdtable_new();
+  if (!root_fdt) die("calloc");
 
-  int in_syscall = 0;
-  int sig_to_deliver = 0;
+  struct proc_tab procs;
+  memset(&procs, 0, sizeof(procs));
+  if (!proctab_add(&procs, child, root_fdt)) die("realloc");
 
-  for (;;) {
-    if (ptrace(PTRACE_SYSCALL, child, 0, (void *)(uintptr_t)sig_to_deliver) < 0) die("PTRACE_SYSCALL");
-    sig_to_deliver = 0;
+  if (ptrace(PTRACE_SYSCALL, child, 0, 0) < 0) die("PTRACE_SYSCALL");
 
-    if (waitpid(child, &status, 0) < 0) die("waitpid");
-    if (WIFEXITED(status) || WIFSIGNALED(status)) break;
+  while (procs.n) {
+    pid_t pid = waitpid(-1, &status, __WALL);
+    if (pid < 0) {
+      if (errno == EINTR) continue;
+      die("waitpid");
+    }
+
+    struct proc_state *ps = proctab_find(&procs, pid);
+    if (!ps) {
+      // Unknown pid; best effort: keep it running without signal.
+      (void)ptrace(PTRACE_SYSCALL, pid, 0, 0);
+      continue;
+    }
+
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+      proctab_del(&procs, pid, sock, &rr);
+      continue;
+    }
     if (!WIFSTOPPED(status)) continue;
 
     int sig = WSTOPSIG(status);
+    int deliver = 0;
+
     if (sig == (SIGTRAP | 0x80)) {
       struct user_regs_struct regs;
-      if (ptrace(PTRACE_GETREGS, child, 0, &regs) < 0) die("PTRACE_GETREGS");
+      if (ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0) die("PTRACE_GETREGS");
 
-      if (!in_syscall) {
-        (void)intercept_syscall(child, &regs, sock, &fm, &pend);
-        in_syscall = 1;
+      if (!ps->in_syscall) {
+        (void)intercept_syscall(pid, &regs, sock, &ps->fdt->map, &rr, &ps->pend);
+        ps->in_syscall = 1;
       } else {
-        if (pend.active) {
-          for (size_t i = 0; i < pend.outs_n; i++) {
-            if (pend.outs[i].bytes && pend.outs[i].len) {
-              (void)rsys_write_mem(child, pend.outs[i].addr, pend.outs[i].bytes, pend.outs[i].len);
+        if (ps->pend.active) {
+          for (size_t i = 0; i < ps->pend.outs_n; i++) {
+            if (ps->pend.outs[i].bytes && ps->pend.outs[i].len) {
+              (void)rsys_write_mem(pid, ps->pend.outs[i].addr, ps->pend.outs[i].bytes, ps->pend.outs[i].len);
             }
           }
 
-          regs.rax = (uint64_t)pend.set_rax;
-          if (ptrace(PTRACE_SETREGS, child, 0, &regs) < 0) die("PTRACE_SETREGS");
-
-          if (pend.close_local_fd >= 0 && pend.set_rax == 0) {
-            fdmap_del(&fm, pend.close_local_fd);
-          }
-          pending_clear(&pend);
+          regs.rax = (uint64_t)ps->pend.set_rax;
+          if (ptrace(PTRACE_SETREGS, pid, 0, &regs) < 0) die("PTRACE_SETREGS");
+          pending_clear(&ps->pend);
         }
-        in_syscall = 0;
+        ps->in_syscall = 0;
       }
-      continue;
+    } else if (sig == SIGTRAP) {
+      unsigned event = (unsigned)status >> 16;
+      if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
+        unsigned long msg = 0;
+        if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg) < 0) die("PTRACE_GETEVENTMSG");
+        pid_t newpid = (pid_t)msg;
+
+        struct fd_table *child_fdt = NULL;
+        if (event == PTRACE_EVENT_CLONE) {
+          // Likely a thread: share the same fd table mapping.
+          fdtable_ref(ps->fdt);
+          child_fdt = ps->fdt;
+        } else {
+          child_fdt = fdtable_fork_clone(ps->fdt, &rr);
+          if (!child_fdt) die("calloc");
+        }
+
+        if (!proctab_add(&procs, newpid, child_fdt)) die("realloc");
+        // The new tracee will report an initial SIGSTOP to the tracer; we will
+        // resume it from the main wait loop. Avoid racing with short-lived
+        // children by not issuing ptrace commands here.
+      }
+      // Do not forward SIGTRAP into the tracee.
+      deliver = 0;
+    } else if (sig == SIGSTOP) {
+      // Don't forward initial/ptrace SIGSTOP into the tracee.
+      deliver = 0;
+    } else {
+      deliver = sig;
     }
 
-    // Don't forward plain SIGTRAP/SIGSTOP into the tracee (exec/ptrace events, initial stop, etc).
-    if (sig == SIGTRAP || sig == SIGSTOP) {
-      vlog("[rsys] ptrace stop sig=%d (not forwarded)\n", sig);
-      continue;
-    }
-
-    // Forward other signals.
-    sig_to_deliver = sig;
+    if (ptrace(PTRACE_SYSCALL, pid, 0, (void *)(uintptr_t)deliver) < 0) die("PTRACE_SYSCALL");
   }
 
   close(sock);
-  free(fm.v);
+  free(rr.v);
+  free(procs.v);
   return 0;
 }
