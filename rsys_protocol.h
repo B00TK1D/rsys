@@ -58,6 +58,14 @@ enum rsys_msg_type {
   RSYS_REQ_EPOLL_WAIT = 119,
   RSYS_REQ_PPOLL = 120,
   RSYS_REQ_EPOLL_PWAIT = 121,
+
+  // System identity (hostname, uname, etc)
+  RSYS_REQ_UNAME = 130,
+  RSYS_REQ_SETHOSTNAME = 131,
+  RSYS_REQ_SETDOMAINNAME = 132,
+
+  // Environment for tracee exec
+  RSYS_REQ_GETENV = 140,
 };
 
 struct rsys_hdr {

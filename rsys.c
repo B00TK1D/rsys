@@ -13,12 +13,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/ptrace.h>
 #include <sys/reg.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -45,6 +47,73 @@ static void vlog(const char *fmt, ...) {
   va_start(ap, fmt);
   vfprintf(stderr, fmt, ap);
   va_end(ap);
+}
+
+// Forward decl (used by env helpers before definition).
+static int rsys_call(int sock, uint16_t type, const uint8_t *req, uint32_t req_len, struct rsys_resp *out_resp,
+                     uint8_t **out_data, uint32_t *out_data_len);
+
+static void usage(FILE *out, const char *argv0) {
+  fprintf(out,
+          "usage: %s [options] <server_ip_or_host> <port> <prog> [args...]\n"
+          "\n"
+          "Remote syscall forwarding client.\n"
+          "\n"
+          "options:\n"
+          "  -v           verbose logging\n"
+          "  -e           use local environment for the traced program\n"
+          "  -E           use remote environment for the traced program (default)\n"
+          "  -h, -?, --help  show this help\n",
+          argv0);
+}
+
+static int fetch_remote_env(int sock, uint8_t **out_blob, uint32_t *out_len) {
+  struct rsys_resp resp;
+  uint8_t *data = NULL;
+  uint32_t data_len = 0;
+  if (rsys_call(sock, RSYS_REQ_GETENV, NULL, 0, &resp, &data, &data_len) < 0) return -1;
+  int64_t rr = rsys_resp_raw_ret(&resp);
+  int32_t eno = rsys_resp_err_no(&resp);
+  if (rr == -1) {
+    free(data);
+    errno = (eno != 0) ? eno : EIO;
+    return -1;
+  }
+  *out_blob = data;
+  *out_len = data_len;
+  return 0;
+}
+
+static char **envp_from_nul_blob(uint8_t *blob, uint32_t len) {
+  if (!blob || len == 0) {
+    char **envp = (char **)calloc(1, sizeof(char *));
+    return envp;
+  }
+  if (blob[len - 1] != '\0') {
+    // Ensure termination.
+    uint8_t *nb = (uint8_t *)realloc(blob, (size_t)len + 1);
+    if (!nb) return NULL;
+    nb[len] = '\0';
+    blob = nb;
+    len++;
+  }
+  size_t n = 0;
+  for (uint32_t i = 0; i < len; i++) {
+    if (blob[i] == '\0') n++;
+  }
+  char **envp = (char **)calloc(n + 1, sizeof(char *));
+  if (!envp) return NULL;
+  size_t idx = 0;
+  char *p = (char *)blob;
+  char *end = (char *)blob + len;
+  while (p < end) {
+    size_t sl = strlen(p);
+    if (sl == 0) break;
+    envp[idx++] = p;
+    p += sl + 1;
+  }
+  envp[idx] = NULL;
+  return envp;
 }
 
 struct fd_map_ent {
@@ -1156,6 +1225,88 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     regs->orig_rax = __NR_getpid;
     if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
 
+    pending_clear(pend);
+    pend->active = 1;
+    pend->nr = nr;
+    pend->set_rax = rax;
+    return 1;
+  }
+
+  // uname(buf)
+  if (nr == __NR_uname) {
+    uintptr_t u_addr = (uintptr_t)regs->rdi;
+    vlog("[rsys] uname() -> remote\n");
+
+    struct rsys_resp resp;
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    if (rsys_call(sock, RSYS_REQ_UNAME, NULL, 0, &resp, &data, &data_len) < 0) return 0;
+
+    int64_t rr = rsys_resp_raw_ret(&resp);
+    int32_t eno = rsys_resp_err_no(&resp);
+    int64_t rax = raw_sys_ret(rr, eno);
+
+    regs->orig_rax = __NR_getpid;
+    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+
+    pending_clear(pend);
+    pend->active = 1;
+    pend->nr = nr;
+    pend->set_rax = rax;
+
+    if (rr == 0) {
+      if (data_len != (uint32_t)sizeof(struct utsname)) {
+        free(data);
+        pend->set_rax = -EPROTO;
+      } else {
+        (void)pending_add_out(pend, u_addr, data, data_len);
+      }
+    } else {
+      free(data);
+    }
+    return 1;
+  }
+
+  // sethostname(name, len)
+  if (nr == __NR_sethostname || nr == __NR_setdomainname) {
+    uintptr_t name_addr = (uintptr_t)regs->rdi;
+    uint32_t nlen = (uint32_t)regs->rsi;
+    if (nlen > 4096) nlen = 4096;
+    uint8_t *name = NULL;
+    if (name_addr && nlen) {
+      name = (uint8_t *)malloc(nlen);
+      if (!name) die("malloc");
+      if (rsys_read_mem(pid, name, name_addr, nlen) < 0) {
+        free(name);
+        return 0;
+      }
+    } else {
+      nlen = 0;
+    }
+
+    uint32_t req_len = 4 + nlen;
+    uint8_t *req = (uint8_t *)malloc(req_len);
+    if (!req) die("malloc");
+    rsys_put_u32(req + 0, nlen);
+    if (nlen) memcpy(req + 4, name, nlen);
+    free(name);
+
+    uint16_t mtype = (nr == __NR_sethostname) ? RSYS_REQ_SETHOSTNAME : RSYS_REQ_SETDOMAINNAME;
+    vlog("[rsys] %s(len=%u) -> remote\n", (nr == __NR_sethostname) ? "sethostname" : "setdomainname", nlen);
+
+    struct rsys_resp resp;
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    if (rsys_call(sock, mtype, req, req_len, &resp, &data, &data_len) < 0) {
+      free(req);
+      return 0;
+    }
+    free(req);
+    free(data);
+
+    int64_t rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
+    regs->orig_rax = __NR_getpid;
+    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
@@ -2729,12 +2880,32 @@ static void proctab_del(struct proc_tab *t, pid_t pid, int sock, struct remote_r
 
 int main(int argc, char **argv) {
   int argi = 1;
-  if (argc > 1 && strcmp(argv[1], "-v") == 0) {
-    g_verbose = 1;
-    argi++;
+  int use_remote_env = 1; // default
+  while (argi < argc) {
+    const char *a = argv[argi];
+    if (strcmp(a, "-v") == 0) {
+      g_verbose = 1;
+      argi++;
+      continue;
+    }
+    if (strcmp(a, "-e") == 0) {
+      use_remote_env = 0;
+      argi++;
+      continue;
+    }
+    if (strcmp(a, "-E") == 0) {
+      use_remote_env = 1;
+      argi++;
+      continue;
+    }
+    if (strcmp(a, "-h") == 0 || strcmp(a, "-?") == 0 || strcmp(a, "--help") == 0) {
+      usage(stdout, argv[0]);
+      return 0;
+    }
+    break;
   }
   if (argc - argi < 3) {
-    fprintf(stderr, "usage: %s [-v] <server_ip_or_host> <port> <prog> [args...]\n", argv[0]);
+    usage(stderr, argv[0]);
     return 2;
   }
 
@@ -2745,6 +2916,15 @@ int main(int argc, char **argv) {
   if (sock < 0) die("connect");
   vlog("[rsys] connected to %s:%s\n", host, port);
 
+  uint8_t *remote_env_blob = NULL;
+  uint32_t remote_env_len = 0;
+  char **remote_envp = NULL;
+  if (use_remote_env) {
+    if (fetch_remote_env(sock, &remote_env_blob, &remote_env_len) < 0) die("fetch_remote_env");
+    remote_envp = envp_from_nul_blob(remote_env_blob, remote_env_len);
+    if (!remote_envp) die("envp_from_nul_blob");
+  }
+
   // Fork tracee
   pid_t child = fork();
   if (child < 0) die("fork");
@@ -2752,7 +2932,11 @@ int main(int argc, char **argv) {
   if (child == 0) {
     if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) _exit(127);
     raise(SIGSTOP);
-    execvp(argv[argi + 2], &argv[argi + 2]);
+    if (use_remote_env) {
+      execvpe(argv[argi + 2], &argv[argi + 2], remote_envp);
+    } else {
+      execvp(argv[argi + 2], &argv[argi + 2]);
+    }
     _exit(127);
   }
 
@@ -2864,5 +3048,7 @@ int main(int argc, char **argv) {
   close(sock);
   free(rr.v);
   free(procs.v);
+  free(remote_envp);
+  free(remote_env_blob);
   return 0;
 }

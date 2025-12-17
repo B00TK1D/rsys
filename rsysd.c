@@ -16,8 +16,11 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
+
+extern char **environ;
 
 static void die(const char *msg) {
   perror(msg);
@@ -75,6 +78,10 @@ static const char *type_name(uint16_t type) {
     case RSYS_REQ_EPOLL_WAIT: return "epoll_wait";
     case RSYS_REQ_EPOLL_PWAIT: return "epoll_pwait";
     case RSYS_REQ_PPOLL: return "ppoll";
+    case RSYS_REQ_UNAME: return "uname";
+    case RSYS_REQ_SETHOSTNAME: return "sethostname";
+    case RSYS_REQ_SETDOMAINNAME: return "setdomainname";
+    case RSYS_REQ_GETENV: return "getenv";
     default: return "unknown";
   }
 }
@@ -1105,6 +1112,76 @@ static int handle_one(int cfd, uint16_t type, const uint8_t *p, uint32_t len) {
     rsys_resp_set(&resp, r, err, 0);
     int rc = rsys_send_msg(cfd, type, &resp, sizeof(resp));
     free(pfds);
+    return rc;
+  }
+
+  if (type == RSYS_REQ_UNAME) {
+    if (require_len(len, 0) < 0) return -1;
+    struct utsname u;
+    int err;
+    int64_t r = do_syscall_ret(__NR_uname, (long)&u, 0, 0, 0, 0, 0, &err);
+    if (r == 0) {
+      uint32_t dlen = (uint32_t)sizeof(u);
+      uint32_t out_len = (uint32_t)sizeof(resp) + dlen;
+      uint8_t *out = (uint8_t *)malloc(out_len);
+      if (!out) die("malloc");
+      rsys_resp_set(&resp, r, err, dlen);
+      memcpy(out, &resp, sizeof(resp));
+      memcpy(out + sizeof(resp), &u, sizeof(u));
+      int rc = rsys_send_msg(cfd, type, out, out_len);
+      free(out);
+      return rc;
+    }
+    rsys_resp_set(&resp, r, err, 0);
+    return rsys_send_msg(cfd, type, &resp, sizeof(resp));
+  }
+
+  if (type == RSYS_REQ_SETHOSTNAME || type == RSYS_REQ_SETDOMAINNAME) {
+    if (require_len(len, 4) < 0) return -1;
+    uint32_t nlen = rsys_get_u32(p + 0);
+    if (nlen > 4096) nlen = 4096;
+    if (require_blob(len, 4, nlen) < 0) return -1;
+    const char *name = (const char *)(p + 4);
+    int err;
+    long nr = (type == RSYS_REQ_SETHOSTNAME) ? __NR_sethostname : __NR_setdomainname;
+    int64_t r = do_syscall_ret(nr, (long)name, (long)nlen, 0, 0, 0, 0, &err);
+    rsys_resp_set(&resp, r, err, 0);
+    return rsys_send_msg(cfd, type, &resp, sizeof(resp));
+  }
+
+  if (type == RSYS_REQ_GETENV) {
+    if (require_len(len, 0) < 0) return -1;
+
+    // Return environment as NUL-separated "KEY=VAL\0..." bytes (like /proc/self/environ).
+    size_t total = 0;
+    for (char **ep = environ; ep && *ep; ep++) {
+      total += strlen(*ep) + 1;
+      if (total > (1u << 20)) { // 1MB cap
+        total = (1u << 20);
+        break;
+      }
+    }
+
+    uint32_t dlen = (uint32_t)total;
+    uint32_t out_len = (uint32_t)sizeof(resp) + dlen;
+    uint8_t *out = (uint8_t *)malloc(out_len);
+    if (!out) die("malloc");
+
+    rsys_resp_set(&resp, 0, 0, dlen);
+    memcpy(out, &resp, sizeof(resp));
+
+    uint8_t *w = out + sizeof(resp);
+    size_t left = total;
+    for (char **ep = environ; ep && *ep && left; ep++) {
+      size_t n = strlen(*ep) + 1;
+      if (n > left) n = left;
+      memcpy(w, *ep, n);
+      w += n;
+      left -= n;
+    }
+
+    int rc = rsys_send_msg(cfd, type, out, out_len);
+    free(out);
     return rc;
   }
 
