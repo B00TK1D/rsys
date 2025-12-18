@@ -60,11 +60,11 @@ static void usage(FILE *out, const char *argv0) {
           "Remote syscall forwarding client.\n"
           "\n"
           "options:\n"
-          "  -v           verbose logging (if used without an argument)\n"
-          "  -v SRC:DST   expose local SRC at path DST (may be repeated)\n"
-          "  -e           use local environment for the traced program\n"
-          "  -E           use remote environment for the traced program (default)\n"
-          "  -h, -?, --help  show this help\n",
+          "  -v, --verbose          verbose logging\n"
+          "  -m, --mount SRC:DST     expose local SRC at path DST (may be repeated)\n"
+          "  -e                     use local environment for the traced program\n"
+          "  -E                     use remote environment for the traced program (default)\n"
+          "  -h, -?, --help         show this help\n",
           argv0);
 }
 
@@ -1120,6 +1120,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (dirfd_local != AT_FDCWD && dirfd_remote < 0) return 0;
 
     uint32_t path_len = (uint32_t)strlen(path) + 1;
+
     uint32_t req_len = 20 + path_len;
     uint8_t *req = (uint8_t *)malloc(req_len);
     if (!req) die("malloc");
@@ -1210,6 +1211,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (dirfd_local != AT_FDCWD && dirfd_remote < 0) return 0;
 
     uint32_t path_len = (uint32_t)strlen(path) + 1;
+
     uint32_t req_len = 24 + path_len;
     uint8_t *req = (uint8_t *)malloc(req_len);
     if (!req) die("malloc");
@@ -1297,6 +1299,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     vlog("[rsys] access(path=%s, mode=0x%x) -> remote\n", path, mode);
 
     uint32_t path_len = (uint32_t)strlen(path) + 1;
+
     uint32_t req_len = 8 + path_len;
     uint8_t *req = (uint8_t *)malloc(req_len);
     if (!req) die("malloc");
@@ -1352,6 +1355,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (dirfd_local != AT_FDCWD && dirfd_remote < 0) return 0;
 
     uint32_t path_len = (uint32_t)strlen(path) + 1;
+
     uint32_t req_len = 16 + path_len;
     uint8_t *req = (uint8_t *)malloc(req_len);
     if (!req) die("malloc");
@@ -3306,21 +3310,23 @@ int main(int argc, char **argv) {
   mounts_init(&mnts);
   while (argi < argc) {
     const char *a = argv[argi];
-    if (strcmp(a, "-v") == 0) {
-      // Two meanings:
-      // - "-v" alone => verbose logging (backwards compatible)
-      // - "-v SRC:DST" => mount mapping
-      if (argi + 1 < argc && strchr(argv[argi + 1], ':') && argv[argi + 1][0] == '/') {
-        if (mounts_add(&mnts, argv[argi + 1]) < 0) {
-          fprintf(stderr, "invalid -v mount spec: %s\n", argv[argi + 1]);
-          mounts_free(&mnts);
-          return 2;
-        }
-        argi += 2;
-      } else {
-        g_verbose = 1;
-        argi++;
+    if (strcmp(a, "-v") == 0 || strcmp(a, "--verbose") == 0) {
+      g_verbose = 1;
+      argi++;
+      continue;
+    }
+    if (strcmp(a, "-m") == 0 || strcmp(a, "--mount") == 0) {
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing argument for %s\n", a);
+        mounts_free(&mnts);
+        return 2;
       }
+      if (mounts_add(&mnts, argv[argi + 1]) < 0) {
+        fprintf(stderr, "invalid mount spec: %s\n", argv[argi + 1]);
+        mounts_free(&mnts);
+        return 2;
+      }
+      argi += 2;
       continue;
     }
     if (strcmp(a, "-e") == 0) {
