@@ -60,11 +60,128 @@ static void usage(FILE *out, const char *argv0) {
           "Remote syscall forwarding client.\n"
           "\n"
           "options:\n"
-          "  -v           verbose logging\n"
+          "  -v           verbose logging (if used without an argument)\n"
+          "  -v SRC:DST   expose local SRC at path DST (may be repeated)\n"
           "  -e           use local environment for the traced program\n"
           "  -E           use remote environment for the traced program (default)\n"
           "  -h, -?, --help  show this help\n",
           argv0);
+}
+
+struct mount_map {
+  char *local;         // local source prefix
+  char *exposed;       // path seen by tracee
+  size_t local_len;
+  size_t exposed_len;
+};
+
+struct mounts {
+  struct mount_map *v;
+  size_t n;
+  size_t cap;
+};
+
+static void mounts_init(struct mounts *m) {
+  m->v = NULL;
+  m->n = 0;
+  m->cap = 0;
+}
+
+static void mounts_free(struct mounts *m) {
+  if (!m) return;
+  for (size_t i = 0; i < m->n; i++) {
+    free(m->v[i].local);
+    free(m->v[i].exposed);
+  }
+  free(m->v);
+  m->v = NULL;
+  m->n = 0;
+  m->cap = 0;
+}
+
+static void trim_trailing_slashes(char *s) {
+  size_t n = strlen(s);
+  while (n > 1 && s[n - 1] == '/') {
+    s[n - 1] = '\0';
+    n--;
+  }
+}
+
+static int mounts_add(struct mounts *m, const char *spec) {
+  // spec: /local/path:/exposed/path
+  const char *colon = strchr(spec, ':');
+  if (!colon) return -1;
+  size_t llen = (size_t)(colon - spec);
+  size_t elen = strlen(colon + 1);
+  if (llen == 0 || elen == 0) return -1;
+  if (spec[0] != '/' || colon[1] != '/') return -1;
+
+  char *l = (char *)malloc(llen + 1);
+  char *e = (char *)malloc(elen + 1);
+  if (!l || !e) {
+    free(l);
+    free(e);
+    return -1;
+  }
+  memcpy(l, spec, llen);
+  l[llen] = '\0';
+  memcpy(e, colon + 1, elen + 1);
+  trim_trailing_slashes(l);
+  trim_trailing_slashes(e);
+
+  if (m->n == m->cap) {
+    size_t ncap = m->cap ? (m->cap * 2) : 4;
+    void *nv = realloc(m->v, ncap * sizeof(*m->v));
+    if (!nv) {
+      free(l);
+      free(e);
+      return -1;
+    }
+    m->v = (struct mount_map *)nv;
+    m->cap = ncap;
+  }
+  m->v[m->n++] = (struct mount_map){.local = l, .exposed = e, .local_len = strlen(l), .exposed_len = strlen(e)};
+  return 0;
+}
+
+static int mount_translate_alloc(const struct mounts *m, const char *path, char **out_local) {
+  *out_local = NULL;
+  if (!m || m->n == 0 || !path) return 0;
+  if (path[0] != '/') return 0;
+
+  // Longest-prefix match on exposed path.
+  const struct mount_map *best = NULL;
+  for (size_t i = 0; i < m->n; i++) {
+    const struct mount_map *mm = &m->v[i];
+    size_t n = mm->exposed_len;
+    if (strncmp(path, mm->exposed, n) != 0) continue;
+    if (path[n] != '\0' && path[n] != '/') continue;
+    if (!best || n > best->exposed_len) best = mm;
+  }
+  if (!best) return 0;
+
+  const char *suffix = path + best->exposed_len;
+  size_t slen = strlen(suffix);
+  size_t outlen = best->local_len + slen;
+  char *lp = (char *)malloc(outlen + 1);
+  if (!lp) return -1;
+  memcpy(lp, best->local, best->local_len);
+  memcpy(lp + best->local_len, suffix, slen + 1);
+  *out_local = lp;
+  return 1;
+}
+
+static int rewrite_path_arg(pid_t pid, const struct user_regs_struct *regs, uintptr_t *reg_ptr, const char *new_path) {
+  // IMPORTANT: don't overwrite the tracee's original string in-place.
+  // Programs (like bash) may reuse that buffer for later operations; if we mutate it,
+  // we can change user-visible behavior (e.g. cd target path).
+  size_t new_len = strlen(new_path) + 1;
+
+  // Scratch below current stack pointer.
+  uintptr_t scratch = (uintptr_t)((regs->rsp - 0x4000) & ~(uintptr_t)0xFul);
+  if (rsys_write_mem(pid, scratch, new_path, new_len) < 0) return -1;
+  *reg_ptr = scratch;
+  return 0;
 }
 
 static int fetch_remote_env(int sock, uint8_t **out_blob, uint32_t *out_len) {
@@ -114,6 +231,79 @@ static char **envp_from_nul_blob(uint8_t *blob, uint32_t len) {
   }
   envp[idx] = NULL;
   return envp;
+}
+
+static const char *envp_get_value(char **envp, const char *key) {
+  if (!envp || !key) return NULL;
+  size_t klen = strlen(key);
+  for (size_t i = 0; envp[i]; i++) {
+    const char *s = envp[i];
+    if (strncmp(s, key, klen) == 0 && s[klen] == '=') return s + klen + 1;
+  }
+  return NULL;
+}
+
+static int normalize_abs_path(char *out, size_t out_sz, const char *abs_path) {
+  if (!out || out_sz == 0 || !abs_path || abs_path[0] != '/') return -1;
+
+  const char *segs[512];
+  size_t seg_lens[512];
+  size_t nsegs = 0;
+
+  const char *p = abs_path;
+  while (*p) {
+    while (*p == '/') p++;
+    if (!*p) break;
+    const char *start = p;
+    while (*p && *p != '/') p++;
+    size_t len = (size_t)(p - start);
+    if (len == 1 && start[0] == '.') continue;
+    if (len == 2 && start[0] == '.' && start[1] == '.') {
+      if (nsegs) nsegs--;
+      continue;
+    }
+    if (nsegs >= (sizeof(segs) / sizeof(segs[0]))) return -1;
+    segs[nsegs] = start;
+    seg_lens[nsegs] = len;
+    nsegs++;
+  }
+
+  size_t w = 0;
+  out[w++] = '/';
+  if (nsegs == 0) {
+    out[w] = '\0';
+    return 0;
+  }
+  for (size_t i = 0; i < nsegs; i++) {
+    if (i != 0) {
+      if (w + 1 >= out_sz) return -1;
+      out[w++] = '/';
+    }
+    if (w + seg_lens[i] + 1 > out_sz) return -1;
+    memcpy(out + w, segs[i], seg_lens[i]);
+    w += seg_lens[i];
+  }
+  out[w] = '\0';
+  return 0;
+}
+
+static int join_cwd_and_path(char *out, size_t out_sz, const char *cwd_abs, const char *path) {
+  if (!out || out_sz == 0 || !cwd_abs || cwd_abs[0] != '/' || !path) return -1;
+  if (path[0] == '/') return normalize_abs_path(out, out_sz, path);
+
+  char tmp[8192];
+  size_t cwd_len = strlen(cwd_abs);
+  size_t path_len = strlen(path);
+  if (cwd_len == 0) cwd_abs = "/", cwd_len = 1;
+
+  size_t need = cwd_len + 1 + path_len + 1;
+  if (need > sizeof(tmp)) return -1;
+  memcpy(tmp, cwd_abs, cwd_len);
+  tmp[cwd_len] = '/';
+  memcpy(tmp + cwd_len + 1, path, path_len);
+  tmp[cwd_len + 1 + path_len] = '\0';
+
+  return normalize_abs_path(out, out_sz, tmp);
 }
 
 struct fd_map_ent {
@@ -323,6 +513,28 @@ static int rsys_call(int sock, uint16_t type, const uint8_t *req, uint32_t req_l
   return 0;
 }
 
+static void remote_chdir_best_effort(int sock, const char *path) {
+  if (!path || path[0] != '/') return;
+  uint32_t plen = (uint32_t)strlen(path) + 1;
+  if (plen > 4096) return;
+
+  uint32_t req_len = 4 + plen;
+  uint8_t *req = (uint8_t *)malloc(req_len);
+  if (!req) return;
+  rsys_put_u32(req + 0, plen);
+  memcpy(req + 4, path, plen);
+
+  struct rsys_resp resp;
+  uint8_t *data = NULL;
+  uint32_t data_len = 0;
+  if (rsys_call(sock, RSYS_REQ_CHDIR, req, req_len, &resp, &data, &data_len) < 0) {
+    free(req);
+    return;
+  }
+  free(req);
+  free(data);
+}
+
 static int64_t raw_sys_ret(int64_t raw_ret, int32_t err_no) {
   if (raw_ret == -1) return -(int64_t)err_no;
   return raw_ret;
@@ -342,6 +554,20 @@ static int should_remote_path(const char *path) {
     if (strncmp(path, local_prefixes[i], n) == 0) return 0;
   }
   return 1;
+}
+
+static void maybe_make_remote_abs_path(char *path, size_t path_sz, const int *cwd_is_local, const int *cwd_remote_known,
+                                       const char *cwd_remote) {
+  if (!path || path_sz == 0) return;
+  if (path[0] == '/') return;
+  if (cwd_is_local && *cwd_is_local) return;
+  if (!cwd_remote_known || !*cwd_remote_known) return;
+  if (!cwd_remote || cwd_remote[0] != '/') return;
+  char ap[4096];
+  if (join_cwd_and_path(ap, sizeof(ap), cwd_remote, path) == 0) {
+    strncpy(path, ap, path_sz);
+    path[path_sz - 1] = '\0';
+  }
 }
 
 struct pending_sys {
@@ -397,7 +623,8 @@ static int pending_add_out(struct pending_sys *p, uintptr_t addr, uint8_t *bytes
 }
 
 static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct fd_map *fm, struct remote_refs *rrefs,
-                             struct pending_sys *pend) {
+                             const struct mounts *mnts, int *cwd_is_local, int *cwd_remote_known, char *cwd_remote,
+                             size_t cwd_remote_sz, struct pending_sys *pend) {
   long nr = (long)regs->orig_rax;
 
   // Helpers to map local fd to remote fd
@@ -410,6 +637,124 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
   const uint32_t MAX_CTRL = 64u * 1024u;  // cmsg cap
   const uint32_t MAX_IOV = 128;           // iov count cap
 
+  // Local mount remapping for absolute path arguments.
+  auto int maybe_remap_path(uintptr_t addr, uintptr_t *reg_ptr) {
+    if (!addr) return 0;
+    char path[4096];
+    if (rsys_read_cstring(pid, addr, path, sizeof(path)) < 0) return 0;
+    char *lp = NULL;
+    int tr = mount_translate_alloc(mnts, path, &lp);
+    if (tr <= 0) {
+      free(lp);
+      return 0;
+    }
+    int rc = rewrite_path_arg(pid, regs, reg_ptr, lp);
+    if (rc == 0) {
+      vlog("[rsys] mount map: %s -> %s\n", path, lp);
+    }
+    free(lp);
+    return (rc == 0) ? 1 : 0;
+  }
+
+  // chdir(path)
+  if (nr == __NR_chdir) {
+    uintptr_t path_addr = (uintptr_t)regs->rdi;
+    char path[4096];
+    if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+
+    // If it targets a local mount, rewrite and run locally.
+    if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rdi)) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      if (cwd_is_local) *cwd_is_local = 1;
+      return 0;
+    }
+
+    // Otherwise, change cwd on the remote side. We send an absolute, normalized
+    // path so correctness does not depend on rsysd's own cwd.
+    char abs_cwd[4096];
+    if (path[0] == '/') {
+      if (normalize_abs_path(abs_cwd, sizeof(abs_cwd), path) < 0) {
+        strncpy(abs_cwd, path, sizeof(abs_cwd));
+        abs_cwd[sizeof(abs_cwd) - 1] = '\0';
+      }
+    } else if (cwd_remote_known && *cwd_remote_known && cwd_remote && cwd_remote[0] == '/') {
+      if (join_cwd_and_path(abs_cwd, sizeof(abs_cwd), cwd_remote, path) < 0) {
+        strncpy(abs_cwd, path, sizeof(abs_cwd));
+        abs_cwd[sizeof(abs_cwd) - 1] = '\0';
+      }
+    } else {
+      // Unknown base: best-effort send as-is.
+      strncpy(abs_cwd, path, sizeof(abs_cwd));
+      abs_cwd[sizeof(abs_cwd) - 1] = '\0';
+    }
+
+    uint32_t plen = (uint32_t)strlen(abs_cwd) + 1;
+    uint32_t req_len = 4 + plen;
+    uint8_t *req = (uint8_t *)malloc(req_len);
+    if (!req) die("malloc");
+    rsys_put_u32(req + 0, plen);
+    memcpy(req + 4, abs_cwd, plen);
+
+    struct rsys_resp resp;
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    if (rsys_call(sock, RSYS_REQ_CHDIR, req, req_len, &resp, &data, &data_len) < 0) {
+      free(req);
+      return 0;
+    }
+    free(req);
+    free(data);
+
+    int64_t rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
+    if (cwd_is_local && rax == 0) *cwd_is_local = 0;
+    if (rax == 0 && cwd_remote && cwd_remote_sz) {
+      // Update tracked remote cwd only on success.
+      if (abs_cwd[0] == '/' && normalize_abs_path(abs_cwd, sizeof(abs_cwd), abs_cwd) == 0) {
+        strncpy(cwd_remote, abs_cwd, cwd_remote_sz);
+        cwd_remote[cwd_remote_sz - 1] = '\0';
+        if (cwd_remote_known) *cwd_remote_known = 1;
+      }
+    }
+
+    regs->orig_rax = __NR_getpid;
+    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    pending_clear(pend);
+    pend->active = 1;
+    pend->nr = nr;
+    pend->set_rax = rax;
+    return 1;
+  }
+
+  // fchdir(fd)
+  if (nr == __NR_fchdir) {
+    int fd_local = (int)regs->rdi;
+    int fd_remote = map_fd(fd_local);
+    if (fd_remote < 0) {
+      // local fchdir; assume local mode afterwards
+      if (cwd_is_local) *cwd_is_local = 1;
+      return 0;
+    }
+
+    uint8_t req[8];
+    rsys_put_s64(req + 0, (int64_t)fd_remote);
+    struct rsys_resp resp;
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    if (rsys_call(sock, RSYS_REQ_FCHDIR, req, sizeof(req), &resp, &data, &data_len) < 0) return 0;
+    free(data);
+    int64_t rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
+    if (cwd_is_local && rax == 0) *cwd_is_local = 0;
+    if (cwd_remote_known && rax == 0) *cwd_remote_known = 0;
+
+    regs->orig_rax = __NR_getpid;
+    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    pending_clear(pend);
+    pend->active = 1;
+    pend->nr = nr;
+    pend->set_rax = rax;
+    return 1;
+  }
+
   // openat(dirfd, pathname, flags, mode)
   if (nr == __NR_openat) {
     int dirfd_local = (int)regs->rdi;
@@ -417,9 +762,16 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int flags = (int)regs->rdx;
     int mode = (int)regs->r10;
 
+    if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rsi)) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0; // let it run locally with rewritten pathname
+    }
+
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0; // let it run locally on failure
-    if (!should_remote_path(path)) return 0; // local
+    if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0; // local relative
+    maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
+    if (!should_remote_path(path)) return 0;                       // local absolute by policy
 
     vlog("[rsys] openat(dirfd=%d, path=%s, flags=0x%x, mode=0%o) -> remote\n", dirfd_local, path, flags, mode);
 
@@ -751,8 +1103,15 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     uintptr_t st_addr = (uintptr_t)regs->rdx;
     int flags = (int)regs->r10;
 
+    if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rsi)) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+    if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] newfstatat(dirfd=%d, path=%s, flags=0x%x) -> remote\n", dirfd_local, path, flags);
@@ -834,8 +1193,15 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     unsigned int mask = (unsigned int)regs->r10;
     uintptr_t stx_addr = (uintptr_t)regs->r8;
 
+    if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rsi)) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+    if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] statx(dirfd=%d, path=%s, flags=0x%x, mask=0x%x) -> remote\n", dirfd_local, path, flags, mask);
@@ -917,8 +1283,15 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     uintptr_t path_addr = (uintptr_t)regs->rdi;
     int mode = (int)regs->rsi;
 
+    if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rdi)) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+    if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] access(path=%s, mode=0x%x) -> remote\n", path, mode);
@@ -962,8 +1335,15 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     uintptr_t buf_addr = (uintptr_t)regs->rdx;
     size_t bufsz = (size_t)regs->r10;
 
+    if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rsi)) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+    if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] readlinkat(dirfd=%d, path=%s, bufsz=%zu) -> remote\n", dirfd_local, path, bufsz);
@@ -1010,8 +1390,15 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     uintptr_t path_addr = (uintptr_t)regs->rsi;
     int flags = (int)regs->rdx;
 
+    if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rsi)) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+    if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] unlinkat(dirfd=%d, path=%s, flags=0x%x) -> remote\n", dirfd_local, path, flags);
@@ -1058,8 +1445,15 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     uintptr_t path_addr = (uintptr_t)regs->rsi;
     int mode = (int)regs->rdx;
 
+    if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rsi)) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+    if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] mkdirat(dirfd=%d, path=%s, mode=0%o) -> remote\n", dirfd_local, path, mode);
@@ -1108,11 +1502,22 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     uintptr_t newp_addr = (uintptr_t)regs->r10;
     unsigned int flags = (unsigned int)regs->r8;
 
+    int remapped = 0;
+    if (oldp_addr) remapped |= maybe_remap_path(oldp_addr, (uintptr_t *)&regs->rsi);
+    if (newp_addr) remapped |= maybe_remap_path(newp_addr, (uintptr_t *)&regs->r10);
+    if (remapped) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
     char oldp[4096];
     char newp[4096];
     if (rsys_read_cstring(pid, oldp_addr, oldp, sizeof(oldp)) < 0) return 0;
     if (rsys_read_cstring(pid, newp_addr, newp, sizeof(newp)) < 0) return 0;
 
+    if ((oldp[0] != '/' || newp[0] != '/') && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(oldp, sizeof(oldp), cwd_is_local, cwd_remote_known, cwd_remote);
+    maybe_make_remote_abs_path(newp, sizeof(newp), cwd_is_local, cwd_remote_known, cwd_remote);
     if (!should_remote_path(oldp) && !should_remote_path(newp)) return 0;
 
     vlog("[rsys] renameat2(old=%s, new=%s, flags=0x%x) -> remote\n", oldp, newp, flags);
@@ -1166,6 +1571,13 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     uintptr_t times_addr = (uintptr_t)regs->rdx;
     int flags = (int)regs->r10;
 
+    if (path_addr != 0) {
+      if (maybe_remap_path(path_addr, (uintptr_t *)&regs->rsi)) {
+        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        return 0;
+      }
+    }
+
     // Special case: pathname == NULL => operate on dirfd (futimens semantics).
     uint32_t path_len = 0;
     char path[4096];
@@ -1176,6 +1588,8 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
       if (dirfd_remote < 0) return 0;
     } else {
       if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+      if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
+      maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
       if (!should_remote_path(path)) return 0;
       dirfd_remote = (dirfd_local == AT_FDCWD) ? AT_FDCWD : map_fd(dirfd_local);
       if (dirfd_local != AT_FDCWD && dirfd_remote < 0) return 0;
@@ -2830,6 +3244,9 @@ struct proc_state {
   pid_t pid;
   int in_syscall;
   int sig_to_deliver;
+  int cwd_is_local; // when set, treat relative path ops as local
+  int cwd_remote_known;
+  char cwd_remote[4096]; // normalized absolute path for remote-relative resolution
   struct pending_sys pend;
   struct fd_table *fdt;
 };
@@ -2860,6 +3277,10 @@ static struct proc_state *proctab_add(struct proc_tab *t, pid_t pid, struct fd_t
   ps->pid = pid;
   ps->in_syscall = 0;
   ps->sig_to_deliver = 0;
+  ps->cwd_is_local = 0;
+  ps->cwd_remote_known = 1;
+  strncpy(ps->cwd_remote, "/", sizeof(ps->cwd_remote));
+  ps->cwd_remote[sizeof(ps->cwd_remote) - 1] = '\0';
   ps->pend.outs = NULL;
   pending_clear(&ps->pend);
   ps->fdt = fdt;
@@ -2881,11 +3302,25 @@ static void proctab_del(struct proc_tab *t, pid_t pid, int sock, struct remote_r
 int main(int argc, char **argv) {
   int argi = 1;
   int use_remote_env = 1; // default
+  struct mounts mnts;
+  mounts_init(&mnts);
   while (argi < argc) {
     const char *a = argv[argi];
     if (strcmp(a, "-v") == 0) {
-      g_verbose = 1;
-      argi++;
+      // Two meanings:
+      // - "-v" alone => verbose logging (backwards compatible)
+      // - "-v SRC:DST" => mount mapping
+      if (argi + 1 < argc && strchr(argv[argi + 1], ':') && argv[argi + 1][0] == '/') {
+        if (mounts_add(&mnts, argv[argi + 1]) < 0) {
+          fprintf(stderr, "invalid -v mount spec: %s\n", argv[argi + 1]);
+          mounts_free(&mnts);
+          return 2;
+        }
+        argi += 2;
+      } else {
+        g_verbose = 1;
+        argi++;
+      }
       continue;
     }
     if (strcmp(a, "-e") == 0) {
@@ -2906,6 +3341,7 @@ int main(int argc, char **argv) {
   }
   if (argc - argi < 3) {
     usage(stderr, argv[0]);
+    mounts_free(&mnts);
     return 2;
   }
 
@@ -2919,11 +3355,32 @@ int main(int argc, char **argv) {
   uint8_t *remote_env_blob = NULL;
   uint32_t remote_env_len = 0;
   char **remote_envp = NULL;
-  if (use_remote_env) {
+  // Even when not using remote env for exec, we still fetch it so we can pick a
+  // sensible initial remote working directory (otherwise rsysd's inherited cwd,
+  // e.g. /bin, becomes the default for relative remote syscalls like `ls`).
+  {
     if (fetch_remote_env(sock, &remote_env_blob, &remote_env_len) < 0) die("fetch_remote_env");
     remote_envp = envp_from_nul_blob(remote_env_blob, remote_env_len);
     if (!remote_envp) die("envp_from_nul_blob");
   }
+
+  // Initialize remote cwd to something predictable.
+  // Prefer HOME. If that is missing but USER=root, use /root. Otherwise fall back to PWD.
+  const char *home = envp_get_value(remote_envp, "HOME");
+  const char *user = envp_get_value(remote_envp, "USER");
+  const char *pwd = envp_get_value(remote_envp, "PWD");
+  const char *init_cwd = NULL;
+  if (home && home[0] == '/') {
+    init_cwd = home;
+  } else if (user && strcmp(user, "root") == 0) {
+    init_cwd = "/root";
+  } else if (pwd && pwd[0] == '/') {
+    init_cwd = pwd;
+  } else {
+    init_cwd = "/";
+  }
+  vlog("[rsys] init remote cwd: %s\n", init_cwd);
+  remote_chdir_best_effort(sock, init_cwd);
 
   // Fork tracee
   pid_t child = fork();
@@ -2963,7 +3420,17 @@ int main(int argc, char **argv) {
 
   struct proc_tab procs;
   memset(&procs, 0, sizeof(procs));
-  if (!proctab_add(&procs, child, root_fdt)) die("realloc");
+  struct proc_state *root_ps = proctab_add(&procs, child, root_fdt);
+  if (!root_ps) die("realloc");
+  // Seed per-process remote cwd tracking for relative path resolution.
+  {
+    char norm[4096];
+    if (normalize_abs_path(norm, sizeof(norm), init_cwd) == 0) {
+      strncpy(root_ps->cwd_remote, norm, sizeof(root_ps->cwd_remote));
+      root_ps->cwd_remote[sizeof(root_ps->cwd_remote) - 1] = '\0';
+      root_ps->cwd_remote_known = 1;
+    }
+  }
 
   if (ptrace(PTRACE_SYSCALL, child, 0, 0) < 0) die("PTRACE_SYSCALL");
 
@@ -2995,7 +3462,8 @@ int main(int argc, char **argv) {
       if (ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0) die("PTRACE_GETREGS");
 
       if (!ps->in_syscall) {
-        (void)intercept_syscall(pid, &regs, sock, &ps->fdt->map, &rr, &ps->pend);
+        (void)intercept_syscall(pid, &regs, sock, &ps->fdt->map, &rr, &mnts, &ps->cwd_is_local, &ps->cwd_remote_known,
+                                ps->cwd_remote, sizeof(ps->cwd_remote), &ps->pend);
         ps->in_syscall = 1;
       } else {
         if (ps->pend.active) {
@@ -3028,7 +3496,12 @@ int main(int argc, char **argv) {
           if (!child_fdt) die("calloc");
         }
 
-        if (!proctab_add(&procs, newpid, child_fdt)) die("realloc");
+        struct proc_state *nps = proctab_add(&procs, newpid, child_fdt);
+        if (!nps) die("realloc");
+        nps->cwd_is_local = ps->cwd_is_local;
+        nps->cwd_remote_known = ps->cwd_remote_known;
+        strncpy(nps->cwd_remote, ps->cwd_remote, sizeof(nps->cwd_remote));
+        nps->cwd_remote[sizeof(nps->cwd_remote) - 1] = '\0';
         // The new tracee will report an initial SIGSTOP to the tracer; we will
         // resume it from the main wait loop. Avoid racing with short-lived
         // children by not issuing ptrace commands here.
@@ -3050,5 +3523,6 @@ int main(int argc, char **argv) {
   free(procs.v);
   free(remote_envp);
   free(remote_env_blob);
+  mounts_free(&mnts);
   return 0;
 }

@@ -11,6 +11,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
+#include <pwd.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
@@ -82,6 +84,8 @@ static const char *type_name(uint16_t type) {
     case RSYS_REQ_SETHOSTNAME: return "sethostname";
     case RSYS_REQ_SETDOMAINNAME: return "setdomainname";
     case RSYS_REQ_GETENV: return "getenv";
+    case RSYS_REQ_CHDIR: return "chdir";
+    case RSYS_REQ_FCHDIR: return "fchdir";
     default: return "unknown";
   }
 }
@@ -1185,6 +1189,31 @@ static int handle_one(int cfd, uint16_t type, const uint8_t *p, uint32_t len) {
     return rc;
   }
 
+  if (type == RSYS_REQ_CHDIR) {
+    if (require_len(len, 4) < 0) return -1;
+    uint32_t plen = rsys_get_u32(p + 0);
+    if (plen > 4096) plen = 4096;
+    if (require_blob(len, 4, plen) < 0) return -1;
+    const char *path = (const char *)(p + 4);
+    if (plen == 0 || path[plen - 1] != '\0') {
+      errno = EPROTO;
+      return -1;
+    }
+    int err;
+    int64_t r = do_syscall_ret(__NR_chdir, (long)path, 0, 0, 0, 0, 0, &err);
+    rsys_resp_set(&resp, r, err, 0);
+    return rsys_send_msg(cfd, type, &resp, sizeof(resp));
+  }
+
+  if (type == RSYS_REQ_FCHDIR) {
+    if (require_len(len, 8) < 0) return -1;
+    int64_t fd = rsys_get_s64(p + 0);
+    int err;
+    int64_t r = do_syscall_ret(__NR_fchdir, (long)fd, 0, 0, 0, 0, 0, &err);
+    rsys_resp_set(&resp, r, err, 0);
+    return rsys_send_msg(cfd, type, &resp, sizeof(resp));
+  }
+
   errno = ENOSYS;
   return -1;
 }
@@ -1262,6 +1291,32 @@ int main(int argc, char **argv) {
     if (pid < 0) die("fork");
     if (pid == 0) {
       close(s);
+
+      // Each client gets its own worker process. Ensure a predictable initial
+      // working directory for relative remote operations (AT_FDCWD + relative paths).
+      // If rsysd is started by a service manager, its inherited cwd can be something
+      // surprising (e.g., /bin), which makes commands like `ls` appear to "start" in
+      // the wrong directory until the user manually `cd`s.
+      const char *home = getenv("HOME");
+      if (!(home && home[0] == '/')) home = NULL;
+      if (!home) {
+        struct passwd pw, *pwp = NULL;
+        char buf[16384];
+        if (getpwuid_r(getuid(), &pw, buf, sizeof(buf), &pwp) == 0 && pwp && pwp->pw_dir && pwp->pw_dir[0] == '/') {
+          home = pwp->pw_dir;
+        }
+      }
+      if (home) {
+        if (chdir(home) < 0) {
+          // Ignore: keep inherited cwd if home is unusable.
+        }
+      }
+      // Keep PWD consistent with the actual process cwd for shells that rely on it.
+      char cwd[PATH_MAX];
+      if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        (void)setenv("PWD", cwd, 1);
+      }
+
       vlog("[rsysd] client connected\n");
       serve_client(cfd);
       _exit(0);

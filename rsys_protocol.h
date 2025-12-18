@@ -66,6 +66,10 @@ enum rsys_msg_type {
 
   // Environment for tracee exec
   RSYS_REQ_GETENV = 140,
+
+  // Remote working directory control
+  RSYS_REQ_CHDIR = 141,
+  RSYS_REQ_FCHDIR = 142,
 };
 
 struct rsys_hdr {
