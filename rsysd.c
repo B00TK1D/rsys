@@ -546,6 +546,18 @@ static int handle_one(int cfd, uint16_t type, const uint8_t *p, uint32_t len) {
     int64_t proto = rsys_get_s64(p + 16);
     int err;
     int64_t r = do_syscall_ret(__NR_socket, (long)domain, (long)stype, (long)proto, 0, 0, 0, &err);
+    if (g_verbose) {
+      if (r >= 0) {
+        int so_type = 0;
+        socklen_t sl = sizeof(so_type);
+        int gs = getsockopt((int)r, SOL_SOCKET, SO_TYPE, &so_type, &sl);
+        vlog("[rsysd] socket(domain=%" PRId64 ", type=%" PRId64 ", proto=%" PRId64 ") -> fd=%" PRId64 " so_type=%d gs_errno=%d\n",
+             domain, stype, proto, r, so_type, (gs == 0) ? 0 : errno);
+      } else {
+        vlog("[rsysd] socket(domain=%" PRId64 ", type=%" PRId64 ", proto=%" PRId64 ") -> %" PRId64 " errno=%d\n", domain, stype, proto, r,
+             err);
+      }
+    }
     rsys_resp_set(&resp, r, err, 0);
     return rsys_send_msg(cfd, type, &resp, sizeof(resp));
   }
@@ -874,8 +886,19 @@ static int handle_one(int cfd, uint16_t type, const uint8_t *p, uint32_t len) {
 
     int err;
     int64_t r = do_syscall_ret(__NR_recvmsg, (long)fd, (long)&mh, (long)flags, 0, 0, 0, &err);
+    if (g_verbose && r < 0) {
+      int so_type = 0;
+      socklen_t sl = sizeof(so_type);
+      int gs = getsockopt((int)fd, SOL_SOCKET, SO_TYPE, &so_type, &sl);
+      vlog("[rsysd] recvmsg(fd=%" PRId64 ", flags=0x%" PRIx64 ") -> %" PRId64 " errno=%d so_type=%d gs_errno=%d\n",
+           fd, (uint64_t)flags, r, err, so_type, (gs == 0) ? 0 : errno);
+    }
     if (r >= 0) {
+      // recvmsg() can return a length larger than the provided buffer when MSG_TRUNC
+      // is used (common with netlink MSG_PEEK|MSG_TRUNC). Only copy what we actually
+      // received into our buffer (total_max), but keep the original return value.
       uint32_t out_dlen = (r > 0) ? (uint32_t)r : 0;
+      if (out_dlen > total_max) out_dlen = total_max;
       uint32_t out_nlen = (uint32_t)mh.msg_namelen;
       if (out_nlen > name_max) out_nlen = name_max;
       uint32_t out_clen = (uint32_t)mh.msg_controllen;
