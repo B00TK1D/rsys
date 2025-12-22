@@ -25,19 +25,19 @@ Start the server on the remote host:
 Run a program via the client (connects to `rsysd` and execs the program locally):
 
 ```bash
-./rsys 192.0.2.10 5555 /bin/ls -la
+./rsys 192.0.2.10 5555 ls -la
 ```
 
 Enable verbose logging:
 
 ```bash
-./rsys -v 192.0.2.10 5555 /usr/bin/curl https://example.com/
+./rsys -v 192.0.2.10 5555 curl https://example.com/
 ```
 
 Expose a local path at a different path for the traced program (repeatable):
 
 ```bash
-./rsys -m /home/me/project:/mnt/project 192.0.2.10 5555 /bin/ls /mnt/project
+./rsys -m /home/me/project:/mnt/project 192.0.2.10 5555 ls /mnt/project
 ```
 
 Client options (see `rsys -h` for the authoritative list):
