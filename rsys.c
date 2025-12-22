@@ -22,6 +22,11 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <linux/close_range.h>
+
+#ifndef CLOSE_RANGE_CLOEXEC
+#define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -55,6 +60,8 @@ static void vlog(const char *fmt, ...) {
 // Forward decl (used by env helpers before definition).
 static int rsys_call(int sock, uint16_t type, const uint8_t *req, uint32_t req_len, struct rsys_resp *out_resp,
                      uint8_t **out_data, uint32_t *out_data_len);
+
+static void remote_close_best_effort(int sock, int remote_fd);
 
 static void usage(FILE *out, const char *argv0) {
   fprintf(out,
@@ -380,6 +387,8 @@ struct fd_map {
   int next_local;
 };
 
+static int fdmap_remove_local(struct fd_map *m, int local_fd, int *out_remote_fd);
+
 static void fdmap_init(struct fd_map *m) {
   m->v = NULL;
   m->n = 0;
@@ -409,6 +418,18 @@ static int fdmap_add_existing(struct fd_map *m, struct remote_refs *rrefs, int l
     return -1;
   }
   return 0;
+}
+
+static void fdmap_remove_all_local_and_close(struct fd_map *m, struct remote_refs *rrefs, int sock, int local_fd) {
+  for (;;) {
+    int removed_remote = -1;
+    if (fdmap_remove_local(m, local_fd, &removed_remote) < 0) break;
+    if (removed_remote >= 0) {
+      if (rrefs_dec(rrefs, removed_remote) == 0) {
+        remote_close_best_effort(sock, removed_remote);
+      }
+    }
+  }
 }
 
 static int fdmap_remove_local(struct fd_map *m, int local_fd, int *out_remote_fd) {
@@ -604,6 +625,10 @@ struct pending_sys {
 
   // If the syscall used a fake local fd, remember it for close cleanup.
   int close_local_fd;
+
+  // Track local epoll instances created by the tracee.
+  int track_epoll_create;
+  int epoll_create_flags;
 };
 
 static void pending_clear(struct pending_sys *p) {
@@ -627,6 +652,8 @@ static void pending_clear(struct pending_sys *p) {
   p->outs_n = 0;
   p->outs_cap = 0;
   p->close_local_fd = -1;
+  p->track_epoll_create = 0;
+  p->epoll_create_flags = 0;
 }
 
 static int pending_add_out(struct pending_sys *p, uintptr_t addr, uint8_t *bytes, uint32_t len) {
@@ -645,10 +672,116 @@ static int pending_add_out(struct pending_sys *p, uintptr_t addr, uint8_t *bytes
   return 0;
 }
 
+// Virtual epoll support: keep local epoll fds real, but emulate watching remote fds.
+struct epoll_watch {
+  int local_fd;   // tracee local fd number used in epoll_ctl
+  int remote_fd;  // mapped remote fd (stable)
+  uint32_t events;
+  uint64_t data;
+};
+
+struct epoll_state {
+  int epfd_local; // tracee local epoll fd
+  struct epoll_watch *w;
+  size_t n;
+  size_t cap;
+};
+
+struct epoll_table {
+  struct epoll_state *v;
+  size_t n;
+  size_t cap;
+};
+
+static void epoll_table_init(struct epoll_table *t) {
+  memset(t, 0, sizeof(*t));
+}
+
+static struct epoll_state *epoll_table_find(struct epoll_table *t, int epfd_local) {
+  if (!t) return NULL;
+  for (size_t i = 0; i < t->n; i++) {
+    if (t->v[i].epfd_local == epfd_local) return &t->v[i];
+  }
+  return NULL;
+}
+
+static void epoll_state_free(struct epoll_state *s) {
+  if (!s) return;
+  free(s->w);
+  s->w = NULL;
+  s->n = 0;
+  s->cap = 0;
+  s->epfd_local = -1;
+}
+
+static void epoll_table_del(struct epoll_table *t, int epfd_local) {
+  if (!t) return;
+  for (size_t i = 0; i < t->n; i++) {
+    if (t->v[i].epfd_local == epfd_local) {
+      epoll_state_free(&t->v[i]);
+      t->v[i] = t->v[t->n - 1];
+      t->n--;
+      return;
+    }
+  }
+}
+
+static int epoll_table_add(struct epoll_table *t, int epfd_local) {
+  if (!t) return -1;
+  if (epoll_table_find(t, epfd_local)) return 0;
+  if (t->n == t->cap) {
+    size_t ncap = t->cap ? (t->cap * 2) : 8;
+    void *nv = realloc(t->v, ncap * sizeof(*t->v));
+    if (!nv) return -1;
+    t->v = (struct epoll_state *)nv;
+    t->cap = ncap;
+  }
+  struct epoll_state *s = &t->v[t->n++];
+  memset(s, 0, sizeof(*s));
+  s->epfd_local = epfd_local;
+  s->w = NULL;
+  s->n = 0;
+  s->cap = 0;
+  return 0;
+}
+
+static int epoll_watch_upsert(struct epoll_state *s, int local_fd, int remote_fd, uint32_t events, uint64_t data) {
+  if (!s) return -1;
+  for (size_t i = 0; i < s->n; i++) {
+    if (s->w[i].local_fd == local_fd) {
+      s->w[i].remote_fd = remote_fd;
+      s->w[i].events = events;
+      s->w[i].data = data;
+      return 0;
+    }
+  }
+  if (s->n == s->cap) {
+    size_t ncap = s->cap ? (s->cap * 2) : 8;
+    void *nv = realloc(s->w, ncap * sizeof(*s->w));
+    if (!nv) return -1;
+    s->w = (struct epoll_watch *)nv;
+    s->cap = ncap;
+  }
+  s->w[s->n++] = (struct epoll_watch){.local_fd = local_fd, .remote_fd = remote_fd, .events = events, .data = data};
+  return 0;
+}
+
+static void epoll_watch_del(struct epoll_state *s, int local_fd) {
+  if (!s) return;
+  for (size_t i = 0; i < s->n; i++) {
+    if (s->w[i].local_fd == local_fd) {
+      s->w[i] = s->w[s->n - 1];
+      s->n--;
+      return;
+    }
+  }
+}
+
 static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct fd_map *fm, struct remote_refs *rrefs,
                              const struct mounts *mnts, int *cwd_is_local, int *cwd_remote_known, char *cwd_remote,
                              size_t cwd_remote_sz, int *virt_ids_known, pid_t *virt_pid, pid_t *virt_tid, pid_t *virt_ppid,
-                             pid_t *virt_pgid, pid_t *virt_sid, struct pending_sys *pend) {
+                             pid_t *virt_pgid, pid_t *virt_sid, int *local_base, size_t local_base_n, struct epoll_table *ep,
+                             struct pending_sys *pend) {
   long nr = (long)regs->orig_rax;
 
   auto int deny_syscall_ep(pid_t tpid, struct user_regs_struct *tregs, struct pending_sys *tpend, long orig_nr, int err) {
@@ -664,6 +797,58 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
   // Helpers to map local fd to remote fd
   auto int map_fd(int local) {
     return fdmap_find_remote(fm, local);
+  }
+
+  // Local fd alias tracking: map dup'd stdio (4/5/6) back to 0/1/2 so we can
+  // poll readiness safely (fd numbers are per-process; polling them in the tracer
+  // process is only valid for the tracer's own 0/1/2).
+  auto int base_fd_local(int fd) {
+    if (!local_base || local_base_n == 0) return fd;
+    if (fd < 0 || (size_t)fd >= local_base_n) return fd;
+    int cur = fd;
+    for (int it = 0; it < 8; it++) {
+      int nxt = local_base[cur];
+      if (nxt < 0) return cur;
+      if (nxt == cur) return cur;
+      if (nxt < 0 || (size_t)nxt >= local_base_n) return nxt;
+      cur = nxt;
+    }
+    return cur;
+  }
+
+  // Duplicate a tracee-local fd into the tracer process so we can poll it
+  // correctly. Polling tracee fd numbers directly in the tracer is invalid
+  // because fd tables are per-process.
+  auto int pidfd_open_self(void) {
+#ifdef __NR_pidfd_open
+    return (int)syscall(__NR_pidfd_open, (int)pid, 0);
+#else
+    return -1;
+#endif
+  }
+  auto int pidfd_getfd(int pidfd, int target_fd) {
+#if defined(__NR_pidfd_getfd)
+    return (int)syscall(__NR_pidfd_getfd, pidfd, target_fd, 0);
+#else
+    (void)pidfd;
+    (void)target_fd;
+    return -1;
+#endif
+  }
+
+  auto const char *fcntl_cmd_name(int cmd) {
+    switch (cmd) {
+      case F_DUPFD: return "F_DUPFD";
+      case F_DUPFD_CLOEXEC: return "F_DUPFD_CLOEXEC";
+      case F_GETFD: return "F_GETFD";
+      case F_SETFD: return "F_SETFD";
+      case F_GETFL: return "F_GETFL";
+      case F_SETFL: return "F_SETFL";
+      case F_GETLK: return "F_GETLK";
+      case F_SETLK: return "F_SETLK";
+      case F_SETLKW: return "F_SETLKW";
+      default: return "F_?";
+    }
   }
 
   // Virtualized identity syscalls (pid/tid/ppid/etc) so /proc/self coheres with remote /proc.
@@ -778,6 +963,14 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (path[0] != '/') return;
     if (strncmp(path, "/proc/", 6) != 0) return;
 
+    // Do NOT rewrite /proc/.../fd or /proc/.../fdinfo. Many programs (notably OpenSSH)
+    // walk /proc/self/fd to close inherited fds. If we rewrite this to the remote PID,
+    // they will close the wrong local fds and corrupt their own state.
+    if (strncmp(path, "/proc/self/fd", 13) == 0 && (path[13] == '\0' || path[13] == '/')) return;
+    if (strncmp(path, "/proc/self/fdinfo", 17) == 0 && (path[17] == '\0' || path[17] == '/')) return;
+    if (strncmp(path, "/proc/thread-self/fd", 20) == 0 && (path[20] == '\0' || path[20] == '/')) return;
+    if (strncmp(path, "/proc/thread-self/fdinfo", 24) == 0 && (path[24] == '\0' || path[24] == '/')) return;
+
     // /proc/self[/...]
     if (strncmp(path, "/proc/self", 10) == 0 && (path[10] == '\0' || path[10] == '/')) {
       char out[4096];
@@ -800,12 +993,66 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     long lp = strtol(p, &end, 10);
     if (end && end > p && (end[0] == '\0' || end[0] == '/')) {
       if ((pid_t)lp == pid) {
+        // Same fd-walk exclusion for /proc/<pid>/fd[/...] and /proc/<pid>/fdinfo[/...]
+        if (strcmp(end, "/fd") == 0 || strncmp(end, "/fd/", 4) == 0) return;
+        if (strcmp(end, "/fdinfo") == 0 || strncmp(end, "/fdinfo/", 8) == 0) return;
         char out[4096];
         snprintf(out, sizeof(out), "/proc/%d%s", (int)*virt_pid, end);
         strncpy(path, out, path_sz);
         path[path_sz - 1] = '\0';
       }
     }
+  }
+
+  // Helper: detect and force LOCAL semantics for /proc fd-walks.
+  //
+  // Programs like OpenSSH walk /proc/self/fd (or /proc/<pid>/fd) to close inherited
+  // file descriptors. Under PID virtualization, their <pid> may be the remote pid;
+  // forwarding these opens to the remote or rewriting them breaks invariants and can
+  // cause the program to close the wrong local fds (leading to POLLNVAL/EBADF).
+  //
+  // Return values:
+  // - 0: not a /proc fd-walk path
+  // - 1: is a /proc fd-walk path; keep local; no rewrite needed
+  // - 2: is a /proc fd-walk path; keep local; argument rewritten to /proc/self/...
+  auto int procfd_force_local(uintptr_t addr, uintptr_t *reg_ptr) {
+    if (!addr) return 0;
+    char in[4096];
+    if (rsys_read_cstring(pid, addr, in, sizeof(in)) < 0) return 0;
+    if (in[0] != '/' || strncmp(in, "/proc/", 6) != 0) return 0;
+
+    // Direct self/thread-self fd enumerations.
+    if (strncmp(in, "/proc/self/fd", 13) == 0 && (in[13] == '\0' || in[13] == '/')) return 1;
+    if (strncmp(in, "/proc/self/fdinfo", 17) == 0 && (in[17] == '\0' || in[17] == '/')) return 1;
+    if (strncmp(in, "/proc/thread-self/fd", 20) == 0 && (in[20] == '\0' || in[20] == '/')) return 1;
+    if (strncmp(in, "/proc/thread-self/fdinfo", 24) == 0 && (in[24] == '\0' || in[24] == '/')) return 1;
+
+    // Numeric /proc/<pid>/fd... or /proc/<pid>/fdinfo...
+    const char *p = in + 6;
+    char *end = NULL;
+    long n = strtol(p, &end, 10);
+    if (!(end && end > p)) return 0;
+    if (!(end[0] == '\0' || end[0] == '/')) return 0;
+
+    int is_fd = (strcmp(end, "/fd") == 0) || (strncmp(end, "/fd/", 4) == 0);
+    int is_fdinfo = (strcmp(end, "/fdinfo") == 0) || (strncmp(end, "/fdinfo/", 8) == 0);
+    if (!is_fd && !is_fdinfo) return 0;
+
+    // If PID matches local pid, keep local with no rewrite.
+    if ((pid_t)n == pid) return 1;
+
+    // If PID matches virtual pid, rewrite to /proc/self/...
+    if (virt_ids_known && *virt_ids_known && virt_pid && *virt_pid > 0 && (pid_t)n == *virt_pid) {
+      char out[4096];
+      snprintf(out, sizeof(out), "/proc/self%s", end);
+      if (rewrite_path_arg(pid, regs, reg_ptr, out) == 0) {
+        vlog("[rsys] force-local procfd: %s -> %s\n", in, out);
+      }
+      return 2;
+    }
+
+    // Unknown PID: still better to keep local (it refers to local process namespace).
+    return 1;
   }
 
   const uint32_t MAX_BLOB = (1u << 20);   // 1MB per call
@@ -945,6 +1192,18 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
 
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0; // let it run locally on failure
+
+    // /proc fd-walks must remain local (and /proc/<virtpid>/fd... must be rewritten to /proc/self/fd...).
+    {
+      int pfl = procfd_force_local(path_addr, (uintptr_t *)&regs->rsi);
+      if (pfl) {
+        if (pfl == 2) {
+          if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        }
+        return 0;
+      }
+    }
+
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0; // local relative
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     rewrite_proc_self_path(path, sizeof(path));
@@ -1028,32 +1287,89 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
   // close(fd)
   if (nr == __NR_close) {
     int fd_local = (int)regs->rdi;
-    int fd_remote = map_fd(fd_local);
-    if (fd_remote < 0) return 0; // local close
+    int removed_any = 0;
+    // Remove ALL mappings for this local fd. Stale duplicate entries can occur if
+    // a local fd number is reused and an earlier mapping wasn't fully removed.
+    // Duplicates can make map_fd() return a stale remote fd and break apps (ssh).
+    for (;;) {
+      int removed_remote = -1;
+      if (fdmap_remove_local(fm, fd_local, &removed_remote) < 0) break;
+      removed_any = 1;
+      if (removed_remote < 0) continue;
 
-    uint32_t refs = rrefs_get(rrefs, fd_remote);
-    if (refs == 0) return 0; // inconsistent; fall back to local
+      uint32_t refs = rrefs_get(rrefs, removed_remote);
+      if (refs == 0) continue;
+      uint32_t new_refs = rrefs_dec(rrefs, removed_remote);
 
-    // Always remove the mapping for this local fd, so fd reuse won't confuse us.
-    int removed_remote = -1;
-    if (fdmap_remove_local(fm, fd_local, &removed_remote) < 0) return 0;
-    uint32_t new_refs = rrefs_dec(rrefs, removed_remote);
+      // Last reference: close on remote (best-effort).
+      if (new_refs == 0) {
+        vlog("[rsys] close(fd=%d -> remote_fd=%d) -> remote\n", fd_local, removed_remote);
+        uint8_t req[8];
+        rsys_put_s64(req + 0, (int64_t)removed_remote);
+        struct rsys_resp resp;
+        uint8_t *data = NULL;
+        uint32_t data_len = 0;
+        (void)rsys_call(sock, RSYS_REQ_CLOSE, req, sizeof(req), &resp, &data, &data_len);
+        free(data);
+      }
+    }
 
-    // Last reference: close on remote (best-effort).
-    if (new_refs == 0) {
-      vlog("[rsys] close(fd=%d -> remote_fd=%d) -> remote\n", fd_local, fd_remote);
-      uint8_t req[8];
-      rsys_put_s64(req + 0, (int64_t)fd_remote);
-      struct rsys_resp resp;
-      uint8_t *data = NULL;
-      uint32_t data_len = 0;
-      (void)rsys_call(sock, RSYS_REQ_CLOSE, req, sizeof(req), &resp, &data, &data_len);
-      free(data);
+    // If this was not a remote-mapped fd, it is a pure local close; log small fds for debugging.
+    if (!removed_any && g_verbose && fd_local >= 0 && fd_local <= 16) {
+      vlog("[rsys] close(fd=%d) -> local\n", fd_local);
+    }
+
+    // If this is a local epoll fd we are tracking, remove its virtual state.
+    if (!removed_any && ep) {
+      epoll_table_del(ep, fd_local);
+    }
+
+    // Clear local alias tracking for closed fds.
+    if (local_base && fd_local >= 0 && (size_t)fd_local < local_base_n) {
+      local_base[fd_local] = -1;
     }
 
     // Let the real close(2) run so placeholder FDs are actually closed.
     return 0;
   }
+
+#ifdef __NR_close_range
+  // close_range(first, last, flags)
+  if (nr == __NR_close_range) {
+    unsigned int first = (unsigned int)regs->rdi;
+    unsigned int last = (unsigned int)regs->rsi;
+    unsigned int flags = (unsigned int)regs->rdx;
+    vlog("[rsys] close_range(first=%u, last=%u, flags=0x%x)\n", first, last, flags);
+
+    // If we're just setting CLOEXEC, the fds remain open; keep mappings.
+    if ((flags & CLOSE_RANGE_CLOEXEC) != 0) return 0;
+
+    // Remove mappings for any remote-mapped fds that will be closed.
+    for (size_t i = 0; i < fm->n;) {
+      int lfd = fm->v[i].local_fd;
+      if (lfd >= 0 && (unsigned int)lfd >= first && (unsigned int)lfd <= last) {
+        int removed_remote = -1;
+        int lfd_to_remove = lfd;
+        if (fdmap_remove_local(fm, lfd_to_remove, &removed_remote) == 0) {
+          if (removed_remote >= 0) {
+            if (rrefs_dec(rrefs, removed_remote) == 0) remote_close_best_effort(sock, removed_remote);
+          }
+        }
+        // fdmap_remove_local compacts array, so don't increment i.
+        continue;
+      }
+      i++;
+    }
+
+    // Let kernel perform the actual close_range on local placeholder fds.
+    if (local_base && (flags & CLOSE_RANGE_CLOEXEC) == 0) {
+      unsigned int stop = last;
+      if (stop >= local_base_n) stop = (unsigned int)(local_base_n - 1);
+      for (unsigned int fd = first; fd <= stop; fd++) local_base[fd] = -1;
+    }
+    return 0;
+  }
+#endif
 
   // read(fd, buf, count)
   if (nr == __NR_read) {
@@ -1283,6 +1599,17 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
 
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+
+    {
+      int pfl = procfd_force_local(path_addr, (uintptr_t *)&regs->rsi);
+      if (pfl) {
+        if (pfl == 2) {
+          if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        }
+        return 0;
+      }
+    }
+
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     rewrite_proc_self_path(path, sizeof(path));
@@ -1375,6 +1702,17 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
 
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+
+    {
+      int pfl = procfd_force_local(path_addr, (uintptr_t *)&regs->rsi);
+      if (pfl) {
+        if (pfl == 2) {
+          if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        }
+        return 0;
+      }
+    }
+
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     rewrite_proc_self_path(path, sizeof(path));
@@ -1467,6 +1805,17 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
 
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+
+    {
+      int pfl = procfd_force_local(path_addr, (uintptr_t *)&regs->rdi);
+      if (pfl) {
+        if (pfl == 2) {
+          if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        }
+        return 0;
+      }
+    }
+
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     rewrite_proc_self_path(path, sizeof(path));
@@ -1521,6 +1870,17 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
 
     char path[4096];
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
+
+    {
+      int pfl = procfd_force_local(path_addr, (uintptr_t *)&regs->rsi);
+      if (pfl) {
+        if (pfl == 2) {
+          if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        }
+        return 0;
+      }
+    }
+
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
     rewrite_proc_self_path(path, sizeof(path));
@@ -1707,6 +2067,8 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if ((oldp[0] != '/' || newp[0] != '/') && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(oldp, sizeof(oldp), cwd_is_local, cwd_remote_known, cwd_remote);
     maybe_make_remote_abs_path(newp, sizeof(newp), cwd_is_local, cwd_remote_known, cwd_remote);
+    rewrite_proc_self_path(oldp, sizeof(oldp));
+    rewrite_proc_self_path(newp, sizeof(newp));
     if (!should_remote_path(oldp) && !should_remote_path(newp)) return 0;
 
     vlog("[rsys] renameat2(old=%s, new=%s, flags=0x%x) -> remote\n", oldp, newp, flags);
@@ -1756,6 +2118,145 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     pend->set_rax = rax;
     return 1;
   }
+
+#ifdef __NR_renameat
+  // renameat(olddirfd, oldpath, newdirfd, newpath) -> forwarded via renameat2 with flags=0
+  if (nr == __NR_renameat) {
+    int olddirfd_local = (int)regs->rdi;
+    uintptr_t oldp_addr = (uintptr_t)regs->rsi;
+    int newdirfd_local = (int)regs->rdx;
+    uintptr_t newp_addr = (uintptr_t)regs->r10;
+
+    int remapped = 0;
+    if (oldp_addr) remapped |= maybe_remap_path(oldp_addr, (uintptr_t *)&regs->rsi);
+    if (newp_addr) remapped |= maybe_remap_path(newp_addr, (uintptr_t *)&regs->r10);
+    if (remapped) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
+    char oldp[4096];
+    char newp[4096];
+    if (rsys_read_cstring(pid, oldp_addr, oldp, sizeof(oldp)) < 0) return 0;
+    if (rsys_read_cstring(pid, newp_addr, newp, sizeof(newp)) < 0) return 0;
+
+    if ((oldp[0] != '/' || newp[0] != '/') && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(oldp, sizeof(oldp), cwd_is_local, cwd_remote_known, cwd_remote);
+    maybe_make_remote_abs_path(newp, sizeof(newp), cwd_is_local, cwd_remote_known, cwd_remote);
+    rewrite_proc_self_path(oldp, sizeof(oldp));
+    rewrite_proc_self_path(newp, sizeof(newp));
+    if (!should_remote_path(oldp) && !should_remote_path(newp)) return 0;
+
+    vlog("[rsys] renameat(old=%s, new=%s) -> remote\n", oldp, newp);
+
+    if (g_read_only) {
+      return deny_syscall_ep(pid, regs, pend, nr, EPERM);
+    }
+
+    int olddirfd_remote = (olddirfd_local == AT_FDCWD) ? AT_FDCWD : map_fd(olddirfd_local);
+    int newdirfd_remote = (newdirfd_local == AT_FDCWD) ? AT_FDCWD : map_fd(newdirfd_local);
+    if (olddirfd_local != AT_FDCWD && olddirfd_remote < 0) return 0;
+    if (newdirfd_local != AT_FDCWD && newdirfd_remote < 0) return 0;
+
+    uint32_t old_len = (uint32_t)strlen(oldp) + 1;
+    uint32_t new_len = (uint32_t)strlen(newp) + 1;
+    uint32_t req_len = 32 + old_len + new_len;
+    uint8_t *req = (uint8_t *)malloc(req_len);
+    if (!req) die("malloc");
+    rsys_put_s64(req + 0, (int64_t)olddirfd_remote);
+    rsys_put_s64(req + 8, (int64_t)newdirfd_remote);
+    rsys_put_s64(req + 16, 0); // flags
+    rsys_put_u32(req + 24, old_len);
+    rsys_put_u32(req + 28, new_len);
+    memcpy(req + 32, oldp, old_len);
+    memcpy(req + 32 + old_len, newp, new_len);
+
+    struct rsys_resp resp;
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    if (rsys_call(sock, RSYS_REQ_RENAMEAT2, req, req_len, &resp, &data, &data_len) < 0) {
+      free(req);
+      return 0;
+    }
+    free(req);
+    free(data);
+
+    int64_t rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
+    regs->orig_rax = __NR_getpid;
+    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    pending_clear(pend);
+    pend->active = 1;
+    pend->nr = nr;
+    pend->set_rax = rax;
+    return 1;
+  }
+#endif
+
+#ifdef __NR_rename
+  // rename(oldpath, newpath) -> forwarded via renameat2 with AT_FDCWD and flags=0
+  if (nr == __NR_rename) {
+    uintptr_t oldp_addr = (uintptr_t)regs->rdi;
+    uintptr_t newp_addr = (uintptr_t)regs->rsi;
+
+    int remapped = 0;
+    if (oldp_addr) remapped |= maybe_remap_path(oldp_addr, (uintptr_t *)&regs->rdi);
+    if (newp_addr) remapped |= maybe_remap_path(newp_addr, (uintptr_t *)&regs->rsi);
+    if (remapped) {
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      return 0;
+    }
+
+    char oldp[4096];
+    char newp[4096];
+    if (rsys_read_cstring(pid, oldp_addr, oldp, sizeof(oldp)) < 0) return 0;
+    if (rsys_read_cstring(pid, newp_addr, newp, sizeof(newp)) < 0) return 0;
+
+    if ((oldp[0] != '/' || newp[0] != '/') && cwd_is_local && *cwd_is_local) return 0;
+    maybe_make_remote_abs_path(oldp, sizeof(oldp), cwd_is_local, cwd_remote_known, cwd_remote);
+    maybe_make_remote_abs_path(newp, sizeof(newp), cwd_is_local, cwd_remote_known, cwd_remote);
+    rewrite_proc_self_path(oldp, sizeof(oldp));
+    rewrite_proc_self_path(newp, sizeof(newp));
+    if (!should_remote_path(oldp) && !should_remote_path(newp)) return 0;
+
+    vlog("[rsys] rename(old=%s, new=%s) -> remote\n", oldp, newp);
+
+    if (g_read_only) {
+      return deny_syscall_ep(pid, regs, pend, nr, EPERM);
+    }
+
+    uint32_t old_len = (uint32_t)strlen(oldp) + 1;
+    uint32_t new_len = (uint32_t)strlen(newp) + 1;
+    uint32_t req_len = 32 + old_len + new_len;
+    uint8_t *req = (uint8_t *)malloc(req_len);
+    if (!req) die("malloc");
+    rsys_put_s64(req + 0, (int64_t)AT_FDCWD);
+    rsys_put_s64(req + 8, (int64_t)AT_FDCWD);
+    rsys_put_s64(req + 16, 0); // flags
+    rsys_put_u32(req + 24, old_len);
+    rsys_put_u32(req + 28, new_len);
+    memcpy(req + 32, oldp, old_len);
+    memcpy(req + 32 + old_len, newp, new_len);
+
+    struct rsys_resp resp;
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    if (rsys_call(sock, RSYS_REQ_RENAMEAT2, req, req_len, &resp, &data, &data_len) < 0) {
+      free(req);
+      return 0;
+    }
+    free(req);
+    free(data);
+
+    int64_t rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
+    regs->orig_rax = __NR_getpid;
+    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    pending_clear(pend);
+    pend->active = 1;
+    pend->nr = nr;
+    pend->set_rax = rax;
+    return 1;
+  }
+#endif
 
   // utimensat(dirfd, pathname, times[2], flags)
   if (nr == __NR_utimensat) {
@@ -3285,7 +3786,32 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int cmd = (int)regs->rsi;
     uint64_t arg = (uint64_t)regs->rdx;
     int fd_remote = map_fd(fd_local);
+    vlog("[rsys] fcntl(fd=%d -> remote_fd=%d, cmd=%s/%d, arg=0x%lx)\n", fd_local, fd_remote, fcntl_cmd_name(cmd), cmd,
+         (unsigned long)arg);
     if (fd_remote < 0) return 0;
+
+    // Important: FD flags like FD_CLOEXEC must be applied to the *local* placeholder
+    // fds, otherwise they leak across exec in the tracee and can break programs
+    // (OpenSSH is particularly sensitive to fd leaks).
+    //
+    // Since rsysd does not exec, mirroring FD_CLOEXEC to the remote fd is not necessary.
+    if (cmd == F_SETFD || cmd == F_GETFD) {
+      vlog("[rsys] fcntl(%s) -> local (placeholder)\n", fcntl_cmd_name(cmd));
+      return 0; // let kernel apply to local placeholder
+    }
+
+    // Duplication fcntl must be handled locally to produce a real local FD,
+    // but we must propagate the remote mapping.
+    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+      vlog("[rsys] fcntl(%s) -> local dup, map-on-exit to remote_fd=%d\n", fcntl_cmd_name(cmd), fd_remote);
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->has_set_rax = 0;      // keep kernel's new fd
+      pend->map_fd_on_exit = 1;   // map new local fd -> same remote fd
+      pend->map_remote_fd = fd_remote;
+      return 0; // let kernel execute local fcntl()
+    }
 
     uint32_t has_flock = 0;
     uint32_t flock_len = 0;
@@ -3348,39 +3874,53 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     return 1;
   }
 
-  // epoll_create1(flags)
-  if (nr == __NR_epoll_create1) {
-    int flags = (int)regs->rdi;
-    uint8_t req[8];
-    rsys_put_s64(req + 0, (int64_t)flags);
-    struct rsys_resp resp;
-    uint8_t *data = NULL;
-    uint32_t data_len = 0;
-    if (rsys_call(sock, RSYS_REQ_EPOLL_CREATE1, req, sizeof(req), &resp, &data, &data_len) < 0) return 0;
-    free(data);
+  // dup/dup2/dup3 on remote-mapped fds: let kernel duplicate the placeholder,
+  // but propagate the mapping to the new local fd.
+  if (nr == __NR_dup || nr == __NR_dup2 || nr == __NR_dup3) {
+    int oldfd = (int)regs->rdi;
+    int rfd = map_fd(oldfd);
+    if (nr == __NR_dup) {
+      vlog("[rsys] dup(oldfd=%d -> remote_fd=%d)\n", oldfd, rfd);
+    } else if (nr == __NR_dup2) {
+      int newfd = (int)regs->rsi;
+      vlog("[rsys] dup2(oldfd=%d -> remote_fd=%d, newfd=%d)\n", oldfd, rfd, newfd);
+    } else {
+      int newfd = (int)regs->rsi;
+      int flags = (int)regs->rdx;
+      vlog("[rsys] dup3(oldfd=%d -> remote_fd=%d, newfd=%d, flags=0x%x)\n", oldfd, rfd, newfd, flags);
+    }
+    if (rfd < 0) return 0;
 
-    int64_t rr = rsys_resp_raw_ret(&resp);
-    int32_t eno = rsys_resp_err_no(&resp);
-    int64_t rax = raw_sys_ret(rr, eno);
+    if (nr == __NR_dup2 || nr == __NR_dup3) {
+      int newfd = (int)regs->rsi;
+      if (newfd != oldfd) {
+        // dup2/dup3 implicitly close newfd if open. Remove any existing mapping(s).
+        fdmap_remove_all_local_and_close(fm, rrefs, sock, newfd);
+      }
+    }
+
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
-    pend->close_local_fd = -1;
-    if (rr >= 0) {
-      pend->has_set_rax = 0;
-      pend->map_fd_on_exit = 1;
-      pend->map_remote_fd = (int)rr;
-      regs->orig_rax = __NR_eventfd2;
-      regs->rdi = 0;
-      regs->rsi = (uint64_t)EFD_CLOEXEC;
-      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-    } else {
-      pend->has_set_rax = 1;
-      pend->set_rax = rax;
-      regs->orig_rax = __NR_getpid;
-      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-    }
-    return 1;
+    pend->has_set_rax = 0;
+    pend->map_fd_on_exit = 1;
+    pend->map_remote_fd = rfd;
+    return 0; // let kernel run dup*, mapping happens on syscall-exit
+  }
+
+  // epoll_create1(flags)
+  if (nr == __NR_epoll_create1) {
+    int flags = (int)regs->rdi;
+    // IMPORTANT: epoll fds must be real epoll instances locally. Returning an eventfd
+    // placeholder breaks Go's runtime (epoll_ctl -> EINVAL). We keep the epoll fd
+    // local and emulate watching remote fds in userspace (see epoll_ctl/wait).
+    pending_clear(pend);
+    pend->active = 1;
+    pend->nr = nr;
+    pend->has_set_rax = 0; // keep kernel return value
+    pend->track_epoll_create = 1;
+    pend->epoll_create_flags = flags;
+    return 0; // let kernel create a real epoll fd in the tracee
   }
 
   // epoll_ctl(epfd, op, fd, event)
@@ -3389,46 +3929,77 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int op = (int)regs->rsi;
     int fd_local = (int)regs->rdx;
     uintptr_t ev_addr = (uintptr_t)regs->r10;
+    struct epoll_state *es = ep ? epoll_table_find(ep, epfd_local) : NULL;
+    if (!es) {
+      // Not a tracked local epoll instance. Fall back to old remote-epoll path (if any).
+      int epfd_remote = map_fd(epfd_local);
+      int fd_remote = map_fd(fd_local);
+      if (epfd_remote < 0 || fd_remote < 0) return 0;
 
-    int epfd_remote = map_fd(epfd_local);
-    int fd_remote = map_fd(fd_local);
-    if (epfd_remote < 0 || fd_remote < 0) return 0;
+      uint32_t has_ev = (ev_addr != 0 && op != EPOLL_CTL_DEL) ? 1u : 0u;
+      uint32_t ev_len = (uint32_t)sizeof(struct epoll_event);
+      uint8_t evbuf[sizeof(struct epoll_event)];
+      if (has_ev) {
+        if (rsys_read_mem(pid, evbuf, ev_addr, ev_len) < 0) return 0;
+      }
 
-    uint32_t has_ev = (ev_addr != 0 && op != EPOLL_CTL_DEL) ? 1u : 0u;
-    uint32_t ev_len = (uint32_t)sizeof(struct epoll_event);
-    uint8_t evbuf[sizeof(struct epoll_event)];
-    if (has_ev) {
-      if (rsys_read_mem(pid, evbuf, ev_addr, ev_len) < 0) return 0;
+      uint32_t req_len = 32 + (has_ev ? ev_len : 0);
+      uint8_t *req = (uint8_t *)malloc(req_len);
+      if (!req) die("malloc");
+      rsys_put_s64(req + 0, (int64_t)epfd_remote);
+      rsys_put_s64(req + 8, (int64_t)op);
+      rsys_put_s64(req + 16, (int64_t)fd_remote);
+      rsys_put_u32(req + 24, has_ev);
+      rsys_put_u32(req + 28, ev_len);
+      if (has_ev) memcpy(req + 32, evbuf, ev_len);
+
+      struct rsys_resp resp;
+      uint8_t *data = NULL;
+      uint32_t data_len = 0;
+      if (rsys_call(sock, RSYS_REQ_EPOLL_CTL, req, req_len, &resp, &data, &data_len) < 0) {
+        free(req);
+        return 0;
+      }
+      free(req);
+      free(data);
+
+      int64_t rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->set_rax = rax;
+      return 1;
     }
 
-    uint32_t req_len = 32 + (has_ev ? ev_len : 0);
-    uint8_t *req = (uint8_t *)malloc(req_len);
-    if (!req) die("malloc");
-    rsys_put_s64(req + 0, (int64_t)epfd_remote);
-    rsys_put_s64(req + 8, (int64_t)op);
-    rsys_put_s64(req + 16, (int64_t)fd_remote);
-    rsys_put_u32(req + 24, has_ev);
-    rsys_put_u32(req + 28, ev_len);
-    if (has_ev) memcpy(req + 32, evbuf, ev_len);
-
-    struct rsys_resp resp;
-    uint8_t *data = NULL;
-    uint32_t data_len = 0;
-    if (rsys_call(sock, RSYS_REQ_EPOLL_CTL, req, req_len, &resp, &data, &data_len) < 0) {
-      free(req);
+    int fd_remote = map_fd(fd_local);
+    if (fd_remote < 0) {
+      // Local fd; let the kernel manage it in the tracee.
       return 0;
     }
-    free(req);
-    free(data);
 
-    int64_t rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
+    // Remote fd: store interest locally; do NOT call kernel epoll_ctl on the placeholder.
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    if (op != EPOLL_CTL_DEL) {
+      if (!ev_addr) return deny_syscall_ep(pid, regs, pend, nr, EINVAL);
+      if (rsys_read_mem(pid, &ev, ev_addr, sizeof(ev)) < 0) return 0;
+      if (epoll_watch_upsert(es, fd_local, fd_remote, ev.events, ev.data.u64) < 0) {
+        return deny_syscall_ep(pid, regs, pend, nr, ENOMEM);
+      }
+    } else {
+      epoll_watch_del(es, fd_local);
+    }
+
     regs->orig_rax = __NR_getpid;
     if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
-    pend->set_rax = rax;
+    pend->set_rax = 0;
     return 1;
+
   }
 
   // epoll_wait(epfd, events, maxevents, timeout)
@@ -3437,6 +4008,126 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     uintptr_t evs_addr = (uintptr_t)regs->rsi;
     int maxevents = (int)regs->rdx;
     int timeout = (int)regs->r10;
+    struct epoll_state *es = ep ? epoll_table_find(ep, epfd_local) : NULL;
+    if (es && es->n > 0) {
+      if (maxevents <= 0) return 0;
+      if ((uint32_t)maxevents > 4096u) maxevents = 4096;
+
+      // We'll synthesize results: local events (via duplicated epfd) + remote readiness (via ppoll).
+      struct epoll_event out[4096];
+      int out_n = 0;
+
+      auto uint16_t epoll_to_poll(uint32_t e) {
+        uint16_t p = 0;
+        if (e & EPOLLIN) p |= POLLIN;
+        if (e & EPOLLOUT) p |= POLLOUT;
+        if (e & EPOLLPRI) p |= POLLPRI;
+#ifdef EPOLLRDHUP
+        if (e & EPOLLRDHUP) p |= POLLRDHUP;
+#endif
+        return p;
+      }
+      auto uint32_t poll_to_epoll(uint16_t r) {
+        uint32_t e = 0;
+        if (r & POLLIN) e |= EPOLLIN;
+        if (r & POLLOUT) e |= EPOLLOUT;
+        if (r & POLLPRI) e |= EPOLLPRI;
+        if (r & POLLHUP) e |= EPOLLHUP;
+        if (r & POLLERR) e |= EPOLLERR;
+#ifdef POLLRDHUP
+        if (r & POLLRDHUP) e |= EPOLLRDHUP;
+#endif
+        if (r & POLLNVAL) e |= EPOLLERR;
+        return e;
+      }
+
+      int timeout_infinite = (timeout < 0);
+      int64_t remaining_ms = timeout_infinite ? -1 : (int64_t)timeout;
+      int64_t slice_ms = 50;
+      if (!timeout_infinite && remaining_ms < slice_ms) slice_ms = remaining_ms;
+      if (timeout == 0) slice_ms = 0;
+
+      for (;;) {
+        // Local events: duplicate epfd into tracer and do epoll_wait(0).
+        int pidfd = pidfd_open_self();
+        if (pidfd >= 0) {
+          int epfd_dup = pidfd_getfd(pidfd, epfd_local);
+          close(pidfd);
+          if (epfd_dup >= 0) {
+            int nloc = epoll_wait(epfd_dup, out, maxevents, 0);
+            close(epfd_dup);
+            if (nloc > 0) out_n = nloc;
+          }
+        }
+
+        // Remote readiness for remote-watched fds.
+        if (out_n < maxevents) {
+          size_t nw = es->n;
+          uint32_t req_len = 32 + (uint32_t)nw * 16;
+          uint8_t *req = (uint8_t *)malloc(req_len);
+          if (!req) die("malloc");
+          rsys_put_u32(req + 0, (uint32_t)nw);
+          rsys_put_u32(req + 4, 1u); // has timeout
+          rsys_put_u32(req + 8, 0u); // no sigmask
+          rsys_put_u32(req + 12, 0u);
+          rsys_put_s64(req + 16, (int64_t)(slice_ms / 1000));
+          rsys_put_s64(req + 24, (int64_t)((slice_ms % 1000) * 1000000LL));
+          uint32_t off = 32;
+          for (uint32_t i = 0; i < (uint32_t)nw; i++) {
+            rsys_put_s64(req + off + 0, (int64_t)es->w[i].remote_fd);
+            rsys_put_u32(req + off + 8, (uint32_t)epoll_to_poll(es->w[i].events));
+            rsys_put_u32(req + off + 12, 0);
+            off += 16;
+          }
+          struct rsys_resp resp;
+          uint8_t *data = NULL;
+          uint32_t data_len = 0;
+          int ok = (rsys_call(sock, RSYS_REQ_PPOLL, req, req_len, &resp, &data, &data_len) == 0);
+          free(req);
+          if (ok && rsys_resp_raw_ret(&resp) >= 0 && data_len == 4u + (uint32_t)nw * 4u && rsys_get_u32(data + 0) == (uint32_t)nw) {
+            for (uint32_t i = 0; i < (uint32_t)nw && out_n < maxevents; i++) {
+              uint16_t pre = (uint16_t)rsys_get_u32(data + 4 + i * 4);
+              if (!pre) continue;
+              uint32_t got = poll_to_epoll(pre);
+              uint32_t report = (got & es->w[i].events) | (got & (EPOLLERR | EPOLLHUP));
+#ifdef EPOLLRDHUP
+              report |= (got & EPOLLRDHUP);
+#endif
+              if (!report) continue;
+              out[out_n].events = report;
+              out[out_n].data.u64 = es->w[i].data;
+              out_n++;
+            }
+          }
+          free(data);
+        }
+
+        if (out_n > 0 || timeout == 0) break;
+        if (!timeout_infinite) {
+          remaining_ms -= slice_ms;
+          if (remaining_ms <= 0) break;
+          if (remaining_ms < slice_ms) slice_ms = remaining_ms;
+        }
+        if (slice_ms < 500) slice_ms *= 2;
+      }
+
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->set_rax = out_n;
+      if (out_n > 0) {
+        uint32_t blen = (uint32_t)out_n * (uint32_t)sizeof(struct epoll_event);
+        uint8_t *bb = (uint8_t *)malloc(blen);
+        if (!bb) die("malloc");
+        memcpy(bb, out, blen);
+        (void)pending_add_out(pend, evs_addr, bb, blen);
+      }
+      return 1;
+    }
+
+    // Not a local-virtual epoll. Fall back to remote-epoll path if epfd is remote-mapped.
     int epfd_remote = map_fd(epfd_local);
     if (epfd_remote < 0) return 0;
     if (maxevents < 0) return 0;
@@ -3486,7 +4177,126 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int timeout = (int)regs->r10;
     uintptr_t sig_addr = (uintptr_t)regs->r8;
     uint64_t sigsz = (uint64_t)regs->r9;
+    // Virtual epoll handling for local epoll fds (Go runtime uses epoll_pwait).
+    struct epoll_state *es = ep ? epoll_table_find(ep, epfd_local) : NULL;
+    if (es && es->n > 0) {
+      if (maxevents <= 0) return 0;
+      if ((uint32_t)maxevents > 4096u) maxevents = 4096;
 
+      struct epoll_event out[4096];
+      int out_n = 0;
+
+      auto uint16_t epoll_to_poll(uint32_t e) {
+        uint16_t p = 0;
+        if (e & EPOLLIN) p |= POLLIN;
+        if (e & EPOLLOUT) p |= POLLOUT;
+        if (e & EPOLLPRI) p |= POLLPRI;
+#ifdef EPOLLRDHUP
+        if (e & EPOLLRDHUP) p |= POLLRDHUP;
+#endif
+        return p;
+      }
+      auto uint32_t poll_to_epoll(uint16_t r) {
+        uint32_t e = 0;
+        if (r & POLLIN) e |= EPOLLIN;
+        if (r & POLLOUT) e |= EPOLLOUT;
+        if (r & POLLPRI) e |= EPOLLPRI;
+        if (r & POLLHUP) e |= EPOLLHUP;
+        if (r & POLLERR) e |= EPOLLERR;
+#ifdef POLLRDHUP
+        if (r & POLLRDHUP) e |= EPOLLRDHUP;
+#endif
+        if (r & POLLNVAL) e |= EPOLLERR;
+        return e;
+      }
+
+      int timeout_infinite = (timeout < 0);
+      int64_t remaining_ms = timeout_infinite ? -1 : (int64_t)timeout;
+      int64_t slice_ms = 50;
+      if (!timeout_infinite && remaining_ms < slice_ms) slice_ms = remaining_ms;
+      if (timeout == 0) slice_ms = 0;
+
+      for (;;) {
+        // Local events: duplicate epfd into tracer and do epoll_wait(0).
+        int pidfd = pidfd_open_self();
+        if (pidfd >= 0) {
+          int epfd_dup = pidfd_getfd(pidfd, epfd_local);
+          close(pidfd);
+          if (epfd_dup >= 0) {
+            int nloc = epoll_wait(epfd_dup, out, maxevents, 0);
+            close(epfd_dup);
+            if (nloc > 0) out_n = nloc;
+          }
+        }
+
+        // Remote readiness for remote-watched fds.
+        if (out_n < maxevents) {
+          size_t nw = es->n;
+          uint32_t req_len = 32 + (uint32_t)nw * 16;
+          uint8_t *req = (uint8_t *)malloc(req_len);
+          if (!req) die("malloc");
+          rsys_put_u32(req + 0, (uint32_t)nw);
+          rsys_put_u32(req + 4, 1u); // has timeout
+          rsys_put_u32(req + 8, 0u); // no sigmask (best-effort)
+          rsys_put_u32(req + 12, 0u);
+          rsys_put_s64(req + 16, (int64_t)(slice_ms / 1000));
+          rsys_put_s64(req + 24, (int64_t)((slice_ms % 1000) * 1000000LL));
+          uint32_t off = 32;
+          for (uint32_t i = 0; i < (uint32_t)nw; i++) {
+            rsys_put_s64(req + off + 0, (int64_t)es->w[i].remote_fd);
+            rsys_put_u32(req + off + 8, (uint32_t)epoll_to_poll(es->w[i].events));
+            rsys_put_u32(req + off + 12, 0);
+            off += 16;
+          }
+          struct rsys_resp resp;
+          uint8_t *data = NULL;
+          uint32_t data_len = 0;
+          int ok = (rsys_call(sock, RSYS_REQ_PPOLL, req, req_len, &resp, &data, &data_len) == 0);
+          free(req);
+          if (ok && rsys_resp_raw_ret(&resp) >= 0 && data_len == 4u + (uint32_t)nw * 4u && rsys_get_u32(data + 0) == (uint32_t)nw) {
+            for (uint32_t i = 0; i < (uint32_t)nw && out_n < maxevents; i++) {
+              uint16_t pre = (uint16_t)rsys_get_u32(data + 4 + i * 4);
+              if (!pre) continue;
+              uint32_t got = poll_to_epoll(pre);
+              uint32_t report = (got & es->w[i].events) | (got & (EPOLLERR | EPOLLHUP));
+#ifdef EPOLLRDHUP
+              report |= (got & EPOLLRDHUP);
+#endif
+              if (!report) continue;
+              out[out_n].events = report;
+              out[out_n].data.u64 = es->w[i].data;
+              out_n++;
+            }
+          }
+          free(data);
+        }
+
+        if (out_n > 0 || timeout == 0) break;
+        if (!timeout_infinite) {
+          remaining_ms -= slice_ms;
+          if (remaining_ms <= 0) break;
+          if (remaining_ms < slice_ms) slice_ms = remaining_ms;
+        }
+        if (slice_ms < 500) slice_ms *= 2;
+      }
+
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->set_rax = out_n;
+      if (out_n > 0) {
+        uint32_t blen = (uint32_t)out_n * (uint32_t)sizeof(struct epoll_event);
+        uint8_t *bb = (uint8_t *)malloc(blen);
+        if (!bb) die("malloc");
+        memcpy(bb, out, blen);
+        (void)pending_add_out(pend, evs_addr, bb, blen);
+      }
+      return 1;
+    }
+
+    // Fallback: remote epoll_pwait if epfd is remote-mapped.
     int epfd_remote = map_fd(epfd_local);
     if (epfd_remote < 0) return 0;
     if (maxevents < 0) return 0;
@@ -3602,16 +4412,56 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     for (;;) {
       // Local readiness check (0 timeout) for local-only fds.
       struct pollfd *lp = NULL;
+      uint16_t *lp_rev = NULL;
+      uint16_t *rp_rev = NULL;
       if (any_local) {
         lp = (struct pollfd *)malloc((size_t)nfds * sizeof(*lp));
         if (!lp) die("malloc");
         memcpy(lp, pfds, (size_t)nfds * sizeof(*lp));
+        int pidfd = pidfd_open_self();
+        int *dups = NULL;
+        if (pidfd >= 0) {
+          dups = (int *)malloc((size_t)nfds * sizeof(*dups));
+          if (!dups) die("malloc");
+          for (size_t i = 0; i < (size_t)nfds; i++) dups[i] = -1;
+        }
         for (size_t i = 0; i < (size_t)nfds; i++) {
           if (lp[i].fd < 0) continue;
           if (map_fd(lp[i].fd) >= 0) lp[i].fd = -1;
-          lp[i].revents = 0;
+          // Poll tracee-local fds by duplicating them into this process.
+          if (lp[i].fd >= 0) {
+            if (pidfd >= 0 && dups) {
+              int dupfd = pidfd_getfd(pidfd, lp[i].fd);
+              if (dupfd >= 0) {
+                dups[i] = dupfd;
+                lp[i].fd = dupfd;
+              } else {
+                // Treat as invalid (matches poll(2) behaviour).
+                lp[i].revents = POLLNVAL;
+                lp[i].fd = -1;
+              }
+            } else {
+              // No pidfd_getfd available: best-effort poll only true stdio.
+              int base = base_fd_local(lp[i].fd);
+              if (!(base == 0 || base == 1 || base == 2)) lp[i].fd = -1;
+              else lp[i].fd = base;
+            }
+          }
+          if (lp[i].revents != POLLNVAL) lp[i].revents = 0;
         }
         (void)poll(lp, (nfds_t)nfds, 0);
+        if (g_verbose && nfds <= 64) {
+          lp_rev = (uint16_t *)malloc((size_t)nfds * sizeof(*lp_rev));
+          if (!lp_rev) die("malloc");
+          for (size_t i = 0; i < (size_t)nfds; i++) lp_rev[i] = (uint16_t)lp[i].revents;
+        }
+        if (dups) {
+          for (size_t i = 0; i < (size_t)nfds; i++) {
+            if (dups[i] >= 0) close(dups[i]);
+          }
+          free(dups);
+        }
+        if (pidfd >= 0) close(pidfd);
       }
 
       int64_t use_ns = timeout_infinite ? slice_ns : slice_ns;
@@ -3654,6 +4504,11 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
       if (ok && rsys_resp_raw_ret(&resp) >= 0 && data_len == 4u + (uint32_t)nfds * 4u && rsys_get_u32(data + 0) == (uint32_t)nfds) {
         for (uint32_t i = 0; i < (uint32_t)nfds; i++) pfds[i].revents = (short)(uint16_t)rsys_get_u32(data + 4 + i * 4);
       }
+      if (g_verbose && nfds <= 64) {
+        rp_rev = (uint16_t *)malloc((size_t)nfds * sizeof(*rp_rev));
+        if (!rp_rev) die("malloc");
+        for (size_t i = 0; i < (size_t)nfds; i++) rp_rev[i] = (uint16_t)pfds[i].revents;
+      }
       free(data);
 
       if (lp) {
@@ -3661,10 +4516,42 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
           if (lp[i].fd >= 0) pfds[i].revents |= lp[i].revents;
         }
         free(lp);
+        lp = NULL;
       }
 
       int ready_cnt = 0;
       for (uint32_t i = 0; i < (uint32_t)nfds; i++) if (pfds[i].revents) ready_cnt++;
+
+      if (g_verbose && nfds <= 64) {
+        int has_nval = 0;
+        for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
+          if ((pfds[i].revents & POLLNVAL) != 0) {
+            has_nval = 1;
+            break;
+          }
+        }
+        if (has_nval) {
+          vlog("[rsys] ppoll: POLLNVAL observed (nfds=%" PRIu64 ", any_local=%d, any_remote=%d, ready=%d)\n", nfds, any_local, any_remote,
+               ready_cnt);
+          for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
+            int lfd = pfds[i].fd;
+            int rfd = (lfd < 0) ? -1 : map_fd(lfd);
+            uint16_t ev = (uint16_t)pfds[i].events;
+            uint16_t rr = rp_rev ? rp_rev[i] : 0;
+            uint16_t lr = lp_rev ? lp_rev[i] : 0;
+            uint16_t fr = (uint16_t)pfds[i].revents;
+            if ((fr & POLLNVAL) != 0) {
+              vlog("[rsys]   i=%u lfd=%d rfd=%d events=0x%x remote_revents=0x%x local_revents=0x%x final_revents=0x%x\n", i, lfd, rfd, ev, rr,
+                   lr, fr);
+            }
+          }
+        }
+      }
+
+      free(lp_rev);
+      free(rp_rev);
+      lp_rev = NULL;
+      rp_rev = NULL;
 
       if (ready_cnt > 0 || (has_tmo && remaining_ns <= 0) || (!any_local)) {
         regs->orig_rax = __NR_getpid;
@@ -3723,16 +4610,53 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
 
     for (;;) {
       struct pollfd *lp = NULL;
+      uint16_t *lp_rev = NULL;
+      uint16_t *rp_rev = NULL;
       if (any_local) {
         lp = (struct pollfd *)malloc((size_t)nfds * sizeof(*lp));
         if (!lp) die("malloc");
         memcpy(lp, pfds, (size_t)nfds * sizeof(*lp));
+        int pidfd = pidfd_open_self();
+        int *dups = NULL;
+        if (pidfd >= 0) {
+          dups = (int *)malloc((size_t)nfds * sizeof(*dups));
+          if (!dups) die("malloc");
+          for (size_t i = 0; i < (size_t)nfds; i++) dups[i] = -1;
+        }
         for (size_t i = 0; i < (size_t)nfds; i++) {
           if (lp[i].fd < 0) continue;
           if (map_fd(lp[i].fd) >= 0) lp[i].fd = -1;
-          lp[i].revents = 0;
+          if (lp[i].fd >= 0) {
+            if (pidfd >= 0 && dups) {
+              int dupfd = pidfd_getfd(pidfd, lp[i].fd);
+              if (dupfd >= 0) {
+                dups[i] = dupfd;
+                lp[i].fd = dupfd;
+              } else {
+                lp[i].revents = POLLNVAL;
+                lp[i].fd = -1;
+              }
+            } else {
+              int base = base_fd_local(lp[i].fd);
+              if (!(base == 0 || base == 1 || base == 2)) lp[i].fd = -1;
+              else lp[i].fd = base;
+            }
+          }
+          if (lp[i].revents != POLLNVAL) lp[i].revents = 0;
         }
         (void)poll(lp, (nfds_t)nfds, 0);
+        if (g_verbose && nfds <= 64) {
+          lp_rev = (uint16_t *)malloc((size_t)nfds * sizeof(*lp_rev));
+          if (!lp_rev) die("malloc");
+          for (size_t i = 0; i < (size_t)nfds; i++) lp_rev[i] = (uint16_t)lp[i].revents;
+        }
+        if (dups) {
+          for (size_t i = 0; i < (size_t)nfds; i++) {
+            if (dups[i] >= 0) close(dups[i]);
+          }
+          free(dups);
+        }
+        if (pidfd >= 0) close(pidfd);
       }
 
       int64_t use_ns = timeout_infinite ? slice_ns : slice_ns;
@@ -3774,6 +4698,11 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
       if (ok && rsys_resp_raw_ret(&resp) >= 0 && data_len == 4u + (uint32_t)nfds * 4u && rsys_get_u32(data + 0) == (uint32_t)nfds) {
         for (uint32_t i = 0; i < (uint32_t)nfds; i++) pfds[i].revents = (short)(uint16_t)rsys_get_u32(data + 4 + i * 4);
       }
+      if (g_verbose && nfds <= 64) {
+        rp_rev = (uint16_t *)malloc((size_t)nfds * sizeof(*rp_rev));
+        if (!rp_rev) die("malloc");
+        for (size_t i = 0; i < (size_t)nfds; i++) rp_rev[i] = (uint16_t)pfds[i].revents;
+      }
       free(data);
 
       if (lp) {
@@ -3781,10 +4710,40 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
           if (lp[i].fd >= 0) pfds[i].revents |= lp[i].revents;
         }
         free(lp);
+        lp = NULL;
       }
 
       int ready_cnt = 0;
       for (uint32_t i = 0; i < (uint32_t)nfds; i++) if (pfds[i].revents) ready_cnt++;
+      if (g_verbose && nfds <= 64) {
+        int has_nval = 0;
+        for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
+          if ((pfds[i].revents & POLLNVAL) != 0) {
+            has_nval = 1;
+            break;
+          }
+        }
+        if (has_nval) {
+          vlog("[rsys] poll: POLLNVAL observed (nfds=%" PRIu64 ", any_local=%d, any_remote=%d, ready=%d)\n", nfds, any_local, any_remote, ready_cnt);
+          for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
+            int lfd = pfds[i].fd;
+            int rfd = (lfd < 0) ? -1 : map_fd(lfd);
+            uint16_t ev = (uint16_t)pfds[i].events;
+            uint16_t rr = rp_rev ? rp_rev[i] : 0;
+            uint16_t lr = lp_rev ? lp_rev[i] : 0;
+            uint16_t fr = (uint16_t)pfds[i].revents;
+            if ((fr & POLLNVAL) != 0) {
+              vlog("[rsys]   i=%u lfd=%d rfd=%d events=0x%x remote_revents=0x%x local_revents=0x%x final_revents=0x%x\n", i, lfd, rfd, ev, rr, lr,
+                   fr);
+            }
+          }
+        }
+      }
+
+      free(lp_rev);
+      free(rp_rev);
+      lp_rev = NULL;
+      rp_rev = NULL;
       if (ready_cnt > 0 || timeout_ms == 0 || (!any_local)) {
         regs->orig_rax = __NR_getpid;
         if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
@@ -3827,6 +4786,10 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
 struct fd_table {
   struct fd_map map;
   uint32_t refs;
+  // Track local fd aliasing (for dup'd stdio); index is local fd number.
+  // -1 means unknown/closed; otherwise points to a "base" fd (often 0/1/2).
+  int local_base[4096];
+  struct epoll_table ep;
 };
 
 static void remote_close_best_effort(int sock, int remote_fd) {
@@ -3844,6 +4807,8 @@ static struct fd_table *fdtable_new(void) {
   if (!t) return NULL;
   fdmap_init(&t->map);
   t->refs = 1;
+  for (size_t i = 0; i < 4096; i++) t->local_base[i] = (int)i;
+  epoll_table_init(&t->ep);
   return t;
 }
 
@@ -3854,6 +4819,21 @@ static struct fd_table *fdtable_fork_clone(const struct fd_table *parent, struct
   if (fdmap_clone(&t->map, &parent->map, rrefs) < 0) {
     free(t);
     return NULL;
+  }
+  memcpy(t->local_base, parent->local_base, sizeof(t->local_base));
+  // Fork: child gets a copy of the local epoll table.
+  epoll_table_init(&t->ep);
+  for (size_t i = 0; i < parent->ep.n; i++) {
+    (void)epoll_table_add(&t->ep, parent->ep.v[i].epfd_local);
+    struct epoll_state *dst = epoll_table_find(&t->ep, parent->ep.v[i].epfd_local);
+    const struct epoll_state *src = &parent->ep.v[i];
+    if (dst && src && src->n) {
+      dst->w = (struct epoll_watch *)malloc(src->n * sizeof(*dst->w));
+      if (!dst->w) die("malloc");
+      memcpy(dst->w, src->w, src->n * sizeof(*dst->w));
+      dst->n = src->n;
+      dst->cap = src->n;
+    }
   }
   return t;
 }
@@ -3867,6 +4847,8 @@ static void fdtable_unref(struct fd_table *t, int sock, struct remote_refs *rref
     int rfd = t->map.v[i].remote_fd;
     if (rrefs_dec(rrefs, rfd) == 0) remote_close_best_effort(sock, rfd);
   }
+  for (size_t i = 0; i < t->ep.n; i++) epoll_state_free(&t->ep.v[i]);
+  free(t->ep.v);
   free(t->map.v);
   free(t);
 }
@@ -4145,7 +5127,8 @@ int main(int argc, char **argv) {
       if (!ps->in_syscall) {
         (void)intercept_syscall(pid, &regs, sock, &ps->fdt->map, &rr, &mnts, &ps->cwd_is_local, &ps->cwd_remote_known,
                                 ps->cwd_remote, sizeof(ps->cwd_remote), &ps->virt_ids_known, &ps->virt_pid, &ps->virt_tid,
-                                &ps->virt_ppid, &ps->virt_pgid, &ps->virt_sid, &ps->pend);
+                                &ps->virt_ppid, &ps->virt_pgid, &ps->virt_sid, ps->fdt->local_base, 4096, &ps->fdt->ep,
+                                &ps->pend);
         ps->in_syscall = 1;
       } else {
         if (ps->pend.active) {
@@ -4155,11 +5138,23 @@ int main(int argc, char **argv) {
             }
           }
 
+          // Track local epoll instances created by the tracee.
+          if (ps->pend.track_epoll_create && (int64_t)regs.rax >= 0) {
+            int epfd_local = (int)regs.rax;
+            if (epoll_table_add(&ps->fdt->ep, epfd_local) == 0) {
+              vlog("[rsys] epoll_create1 -> local epfd=%d (virtual remote watches enabled)\n", epfd_local);
+            }
+          }
+
           // If we created placeholder FD(s), map them to remote FD(s) on syscall exit.
           if (ps->pend.map_fd_on_exit && (int64_t)regs.rax >= 0) {
             int local_fd = (int)regs.rax;
             int remote_fd = ps->pend.map_remote_fd;
             vlog("[rsys] map placeholder fd=%d -> remote_fd=%d\n", local_fd, remote_fd);
+            // If the local fd number is being reused, ensure no stale mapping remains.
+            fdmap_remove_all_local_and_close(&ps->fdt->map, &rr, sock, local_fd);
+            // Clear local alias for this fd (it is now a remote-mapped placeholder).
+            if (local_fd >= 0 && local_fd < 4096) ps->fdt->local_base[local_fd] = -1;
             if (fdmap_add_existing(&ps->fdt->map, &rr, local_fd, remote_fd) < 0) {
               remote_close_best_effort(sock, remote_fd);
               regs.rax = (uint64_t)(-(int64_t)ENOMEM);
@@ -4173,6 +5168,8 @@ int main(int argc, char **argv) {
             if (ps->pend.map_pair_addr) {
               (void)rsys_read_mem(pid, sv, (uintptr_t)ps->pend.map_pair_addr, sizeof(sv));
               if (sv[0] >= 0) {
+                fdmap_remove_all_local_and_close(&ps->fdt->map, &rr, sock, sv[0]);
+                if (sv[0] < 4096) ps->fdt->local_base[sv[0]] = -1;
                 if (fdmap_add_existing(&ps->fdt->map, &rr, sv[0], ps->pend.map_remote_fd0) < 0) {
                   remote_close_best_effort(sock, ps->pend.map_remote_fd0);
                   ps->pend.has_set_rax = 1;
@@ -4181,6 +5178,8 @@ int main(int argc, char **argv) {
                 }
               }
               if (sv[1] >= 0) {
+                fdmap_remove_all_local_and_close(&ps->fdt->map, &rr, sock, sv[1]);
+                if (sv[1] < 4096) ps->fdt->local_base[sv[1]] = -1;
                 if (fdmap_add_existing(&ps->fdt->map, &rr, sv[1], ps->pend.map_remote_fd1) < 0) {
                   remote_close_best_effort(sock, ps->pend.map_remote_fd1);
                   ps->pend.has_set_rax = 1;
@@ -4195,6 +5194,25 @@ int main(int argc, char **argv) {
           if (ptrace(PTRACE_SETREGS, pid, 0, &regs) < 0) die("PTRACE_SETREGS");
           pending_clear(&ps->pend);
         }
+
+      // Track local fd aliasing for dup'd stdio (even when the dup syscalls were not intercepted).
+      if (g_verbose) {
+        long onr = (long)regs.orig_rax;
+        long ret = (long)regs.rax;
+        if ((onr == __NR_dup || onr == __NR_dup2 || onr == __NR_dup3) && ret >= 0) {
+          int oldfd = (int)regs.rdi;
+          int newfd = (onr == __NR_dup) ? (int)ret : (int)regs.rsi;
+          // Only track aliases for local fds (not remote-mapped placeholders).
+          if (oldfd >= 0 && oldfd < 4096 && newfd >= 0 && newfd < 4096) {
+            if (fdmap_find_remote(&ps->fdt->map, oldfd) < 0) {
+              int base = ps->fdt->local_base[oldfd];
+              if (base < 0) base = oldfd;
+              ps->fdt->local_base[newfd] = base;
+              vlog("[rsys] local alias: fd=%d -> base=%d (from dup)\n", newfd, base);
+            }
+          }
+        }
+      }
         ps->in_syscall = 0;
       }
     } else if (sig == SIGTRAP) {
