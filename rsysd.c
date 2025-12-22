@@ -84,6 +84,7 @@ static const char *type_name(uint16_t type) {
     case RSYS_REQ_SETHOSTNAME: return "sethostname";
     case RSYS_REQ_SETDOMAINNAME: return "setdomainname";
     case RSYS_REQ_GETENV: return "getenv";
+    case RSYS_REQ_GETIDS: return "getids";
     case RSYS_REQ_CHDIR: return "chdir";
     case RSYS_REQ_FCHDIR: return "fchdir";
     default: return "unknown";
@@ -1210,6 +1211,24 @@ static int handle_one(int cfd, uint16_t type, const uint8_t *p, uint32_t len) {
     int rc = rsys_send_msg(cfd, type, out, out_len);
     free(out);
     return rc;
+  }
+
+  if (type == RSYS_REQ_GETIDS) {
+    if (require_len(len, 0) < 0) return -1;
+    pid_t pid = getpid();
+    pid_t ppid = getppid();
+    pid_t tid = (pid_t)syscall(__NR_gettid);
+    pid_t pgid = getpgrp();
+    pid_t sid = getsid(0);
+    uint8_t out[sizeof(resp) + 5 * 8];
+    rsys_resp_set(&resp, 0, 0, 5 * 8);
+    memcpy(out, &resp, sizeof(resp));
+    rsys_put_s64(out + sizeof(resp) + 0, (int64_t)pid);
+    rsys_put_s64(out + sizeof(resp) + 8, (int64_t)tid);
+    rsys_put_s64(out + sizeof(resp) + 16, (int64_t)ppid);
+    rsys_put_s64(out + sizeof(resp) + 24, (int64_t)pgid);
+    rsys_put_s64(out + sizeof(resp) + 32, (int64_t)sid);
+    return rsys_send_msg(cfd, type, out, (uint32_t)sizeof(out));
   }
 
   if (type == RSYS_REQ_CHDIR) {

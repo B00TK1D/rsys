@@ -646,7 +646,8 @@ static int pending_add_out(struct pending_sys *p, uintptr_t addr, uint8_t *bytes
 
 static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct fd_map *fm, struct remote_refs *rrefs,
                              const struct mounts *mnts, int *cwd_is_local, int *cwd_remote_known, char *cwd_remote,
-                             size_t cwd_remote_sz, struct pending_sys *pend) {
+                             size_t cwd_remote_sz, int *virt_ids_known, pid_t *virt_pid, pid_t *virt_tid, pid_t *virt_ppid,
+                             pid_t *virt_pgid, pid_t *virt_sid, struct pending_sys *pend) {
   long nr = (long)regs->orig_rax;
 
   auto int deny_syscall_ep(pid_t tpid, struct user_regs_struct *tregs, struct pending_sys *tpend, long orig_nr, int err) {
@@ -662,6 +663,148 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
   // Helpers to map local fd to remote fd
   auto int map_fd(int local) {
     return fdmap_find_remote(fm, local);
+  }
+
+  // Virtualized identity syscalls (pid/tid/ppid/etc) so /proc/self coheres with remote /proc.
+  // WARNING: this changes what programs observe, and must be kept consistent with /proc rewriting.
+  if (virt_ids_known && *virt_ids_known) {
+    if (nr == __NR_getpid) {
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->set_rax = (int64_t)(virt_pid ? *virt_pid : 0);
+      return 1;
+    }
+    if (nr == __NR_gettid) {
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->set_rax = (int64_t)(virt_tid ? *virt_tid : 0);
+      return 1;
+    }
+    if (nr == __NR_getppid) {
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->set_rax = (int64_t)(virt_ppid ? *virt_ppid : 0);
+      return 1;
+    }
+#ifdef __NR_getpgrp
+    if (nr == __NR_getpgrp) {
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->set_rax = (int64_t)(virt_pgid ? *virt_pgid : 0);
+      return 1;
+    }
+#endif
+#ifdef __NR_getpgid
+    if (nr == __NR_getpgid) {
+      pid_t q = (pid_t)regs->rdi;
+      if (q == 0 || (virt_pid && q == *virt_pid)) {
+        regs->orig_rax = __NR_getpid;
+        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        pending_clear(pend);
+        pend->active = 1;
+        pend->nr = nr;
+        pend->set_rax = (int64_t)(virt_pgid ? *virt_pgid : 0);
+        return 1;
+      }
+      // Not self: let it run locally (may not match remote).
+    }
+#endif
+#ifdef __NR_getsid
+    if (nr == __NR_getsid) {
+      pid_t q = (pid_t)regs->rdi;
+      if (q == 0 || (virt_pid && q == *virt_pid)) {
+        regs->orig_rax = __NR_getpid;
+        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        pending_clear(pend);
+        pend->active = 1;
+        pend->nr = nr;
+        pend->set_rax = (int64_t)(virt_sid ? *virt_sid : 0);
+        return 1;
+      }
+      // Not self: let it run locally.
+    }
+#endif
+  }
+
+  // Mitigation: if a program calls kill(getpid(), sig) under pid virtualization,
+  // translate the virtual "self" pid/tid back to the real local ones so behavior
+  // remains sane (e.g. kill(SIGTERM) terminates the process).
+  if (virt_ids_known && *virt_ids_known) {
+    if (nr == __NR_kill) {
+      pid_t target = (pid_t)regs->rdi;
+      if (virt_pid && target == *virt_pid) {
+        regs->rdi = (uint64_t)pid;
+        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      }
+    }
+#ifdef __NR_tgkill
+    if (nr == __NR_tgkill) {
+      pid_t tgid = (pid_t)regs->rdi;
+      pid_t tid = (pid_t)regs->rsi;
+      if (virt_pid && tgid == *virt_pid) regs->rdi = (uint64_t)pid;
+      if (virt_tid && tid == *virt_tid) regs->rsi = (uint64_t)pid; // best-effort: treat as self
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    }
+#endif
+#ifdef __NR_tkill
+    if (nr == __NR_tkill) {
+      pid_t tid = (pid_t)regs->rdi;
+      if (virt_tid && tid == *virt_tid) {
+        regs->rdi = (uint64_t)pid;
+        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      }
+    }
+#endif
+  }
+
+  // Helper: rewrite /proc self-references to match remote pid.
+  auto void rewrite_proc_self_path(char *path, size_t path_sz) {
+    if (!path || path_sz == 0) return;
+    if (!virt_ids_known || !*virt_ids_known) return;
+    if (!virt_pid || *virt_pid <= 0) return;
+    if (path[0] != '/') return;
+    if (strncmp(path, "/proc/", 6) != 0) return;
+
+    // /proc/self[/...]
+    if (strncmp(path, "/proc/self", 10) == 0 && (path[10] == '\0' || path[10] == '/')) {
+      char out[4096];
+      snprintf(out, sizeof(out), "/proc/%d%s", (int)*virt_pid, path + 10);
+      strncpy(path, out, path_sz);
+      path[path_sz - 1] = '\0';
+      return;
+    }
+    // /proc/thread-self[/...]
+    if (strncmp(path, "/proc/thread-self", 16) == 0 && (path[16] == '\0' || path[16] == '/')) {
+      char out[4096];
+      snprintf(out, sizeof(out), "/proc/%d%s", (int)*virt_pid, path + 16);
+      strncpy(path, out, path_sz);
+      path[path_sz - 1] = '\0';
+      return;
+    }
+    // /proc/<localpid>[/...] -> /proc/<virt_pid>[/...]
+    const char *p = path + 6;
+    char *end = NULL;
+    long lp = strtol(p, &end, 10);
+    if (end && end > p && (end[0] == '\0' || end[0] == '/')) {
+      if ((pid_t)lp == pid) {
+        char out[4096];
+        snprintf(out, sizeof(out), "/proc/%d%s", (int)*virt_pid, end);
+        strncpy(path, out, path_sz);
+        path[path_sz - 1] = '\0';
+      }
+    }
   }
 
   const uint32_t MAX_BLOB = (1u << 20);   // 1MB per call
@@ -803,6 +946,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0; // let it run locally on failure
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0; // local relative
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
+    rewrite_proc_self_path(path, sizeof(path));
     if (!should_remote_path(path)) return 0;                       // local absolute by policy
 
     vlog("[rsys] openat(dirfd=%d, path=%s, flags=0x%x, mode=0%o) -> remote\n", dirfd_local, path, flags, mode);
@@ -1140,6 +1284,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
+    rewrite_proc_self_path(path, sizeof(path));
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] newfstatat(dirfd=%d, path=%s, flags=0x%x) -> remote\n", dirfd_local, path, flags);
@@ -1231,6 +1376,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
+    rewrite_proc_self_path(path, sizeof(path));
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] statx(dirfd=%d, path=%s, flags=0x%x, mask=0x%x) -> remote\n", dirfd_local, path, flags, mask);
@@ -1322,6 +1468,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
+    rewrite_proc_self_path(path, sizeof(path));
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] access(path=%s, mode=0x%x) -> remote\n", path, mode);
@@ -1375,6 +1522,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (rsys_read_cstring(pid, path_addr, path, sizeof(path)) < 0) return 0;
     if (path[0] != '/' && cwd_is_local && *cwd_is_local) return 0;
     maybe_make_remote_abs_path(path, sizeof(path), cwd_is_local, cwd_remote_known, cwd_remote);
+    rewrite_proc_self_path(path, sizeof(path));
     if (!should_remote_path(path)) return 0;
 
     vlog("[rsys] readlinkat(dirfd=%d, path=%s, bufsz=%zu) -> remote\n", dirfd_local, path, bufsz);
@@ -3726,6 +3874,13 @@ struct proc_state {
   pid_t pid;
   int in_syscall;
   int sig_to_deliver;
+  // Virtualized remote identity (pid/tid/ppid/pgid/sid) for /proc coherence.
+  int virt_ids_known;
+  pid_t virt_pid;
+  pid_t virt_tid;
+  pid_t virt_ppid;
+  pid_t virt_pgid;
+  pid_t virt_sid;
   int cwd_is_local; // when set, treat relative path ops as local
   int cwd_remote_known;
   char cwd_remote[4096]; // normalized absolute path for remote-relative resolution
@@ -3759,6 +3914,12 @@ static struct proc_state *proctab_add(struct proc_tab *t, pid_t pid, struct fd_t
   ps->pid = pid;
   ps->in_syscall = 0;
   ps->sig_to_deliver = 0;
+  ps->virt_ids_known = 0;
+  ps->virt_pid = 0;
+  ps->virt_tid = 0;
+  ps->virt_ppid = 0;
+  ps->virt_pgid = 0;
+  ps->virt_sid = 0;
   ps->cwd_is_local = 0;
   ps->cwd_remote_known = 1;
   strncpy(ps->cwd_remote, "/", sizeof(ps->cwd_remote));
@@ -3871,6 +4032,27 @@ int main(int argc, char **argv) {
   vlog("[rsys] init remote cwd: %s\n", init_cwd);
   remote_chdir_best_effort(sock, init_cwd);
 
+  // Fetch remote identity (pid/tid/ppid/pgid/sid) for PID/proc virtualization.
+  pid_t remote_pid = 0, remote_tid = 0, remote_ppid = 0, remote_pgid = 0, remote_sid = 0;
+  int remote_ids_ok = 0;
+  {
+    struct rsys_resp resp;
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    if (rsys_call(sock, RSYS_REQ_GETIDS, NULL, 0, &resp, &data, &data_len) == 0 && rsys_resp_raw_ret(&resp) == 0 &&
+        rsys_resp_err_no(&resp) == 0 && data_len == 5u * 8u) {
+      remote_pid = (pid_t)rsys_get_s64(data + 0);
+      remote_tid = (pid_t)rsys_get_s64(data + 8);
+      remote_ppid = (pid_t)rsys_get_s64(data + 16);
+      remote_pgid = (pid_t)rsys_get_s64(data + 24);
+      remote_sid = (pid_t)rsys_get_s64(data + 32);
+      if (remote_pid > 0) remote_ids_ok = 1;
+      vlog("[rsys] remote ids: pid=%d tid=%d ppid=%d pgid=%d sid=%d\n", (int)remote_pid, (int)remote_tid, (int)remote_ppid,
+           (int)remote_pgid, (int)remote_sid);
+    }
+    free(data);
+  }
+
   // Fork tracee
   pid_t child = fork();
   if (child < 0) die("fork");
@@ -3911,6 +4093,14 @@ int main(int argc, char **argv) {
   memset(&procs, 0, sizeof(procs));
   struct proc_state *root_ps = proctab_add(&procs, child, root_fdt);
   if (!root_ps) die("realloc");
+  if (remote_ids_ok) {
+    root_ps->virt_ids_known = 1;
+    root_ps->virt_pid = remote_pid;
+    root_ps->virt_tid = (remote_tid > 0) ? remote_tid : remote_pid;
+    root_ps->virt_ppid = remote_ppid;
+    root_ps->virt_pgid = remote_pgid;
+    root_ps->virt_sid = remote_sid;
+  }
   // Seed per-process remote cwd tracking for relative path resolution.
   {
     char norm[4096];
@@ -3952,7 +4142,8 @@ int main(int argc, char **argv) {
 
       if (!ps->in_syscall) {
         (void)intercept_syscall(pid, &regs, sock, &ps->fdt->map, &rr, &mnts, &ps->cwd_is_local, &ps->cwd_remote_known,
-                                ps->cwd_remote, sizeof(ps->cwd_remote), &ps->pend);
+                                ps->cwd_remote, sizeof(ps->cwd_remote), &ps->virt_ids_known, &ps->virt_pid, &ps->virt_tid,
+                                &ps->virt_ppid, &ps->virt_pgid, &ps->virt_sid, &ps->pend);
         ps->in_syscall = 1;
       } else {
         if (ps->pend.active) {
@@ -4023,6 +4214,12 @@ int main(int argc, char **argv) {
 
         struct proc_state *nps = proctab_add(&procs, newpid, child_fdt);
         if (!nps) die("realloc");
+        nps->virt_ids_known = ps->virt_ids_known;
+        nps->virt_pid = ps->virt_pid;
+        nps->virt_tid = ps->virt_tid;
+        nps->virt_ppid = ps->virt_ppid;
+        nps->virt_pgid = ps->virt_pgid;
+        nps->virt_sid = ps->virt_sid;
         nps->cwd_is_local = ps->cwd_is_local;
         nps->cwd_remote_known = ps->cwd_remote_known;
         strncpy(nps->cwd_remote, ps->cwd_remote, sizeof(nps->cwd_remote));

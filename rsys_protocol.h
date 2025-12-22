@@ -70,6 +70,9 @@ enum rsys_msg_type {
   // Remote working directory control
   RSYS_REQ_CHDIR = 141,
   RSYS_REQ_FCHDIR = 142,
+
+  // Remote identity (pid/tid/ppid/etc) for /proc coherence
+  RSYS_REQ_GETIDS = 143,
 };
 
 struct rsys_hdr {
