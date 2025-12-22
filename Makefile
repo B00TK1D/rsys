@@ -7,11 +7,12 @@ BIN = rsys rsysd
 
 RSYS_SRCS := $(wildcard src/rsys/rsys_*.c)
 RSYSD_SRCS := $(wildcard src/rsysd/rsysd_*.c)
+RSYS_INTERCEPT_SRCS := $(wildcard src/rsys/intercept/*.c)
 
 all: $(BIN)
 
-rsys: rsys.c rsys_protocol.h rsys_tracee_mem.h $(RSYS_SRCS)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ rsys.c $(RSYS_SRCS) $(LDFLAGS)
+rsys: rsys.c rsys_protocol.h rsys_tracee_mem.h $(RSYS_SRCS) $(RSYS_INTERCEPT_SRCS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ rsys.c $(RSYS_SRCS) $(RSYS_INTERCEPT_SRCS) $(LDFLAGS)
 
 rsysd: rsysd.c rsys_protocol.h $(RSYSD_SRCS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ rsysd.c $(RSYSD_SRCS) $(LDFLAGS)

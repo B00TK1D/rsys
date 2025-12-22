@@ -51,3 +51,8 @@ int rsys_maybe_remap_path(struct rsys_intercept_ctx *ctx, uintptr_t addr, uintpt
 int rsys_intercept_virtual_ids(struct rsys_intercept_ctx *ctx, long nr);
 void rsys_intercept_translate_kill_targets(struct rsys_intercept_ctx *ctx, long nr);
 
+static inline int64_t raw_sys_ret(int64_t raw_ret, int32_t err_no) {
+  if (raw_ret == -1) return -(int64_t)err_no;
+  return raw_ret;
+}
+
