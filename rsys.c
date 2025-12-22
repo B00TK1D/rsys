@@ -42,6 +42,7 @@ static void die(const char *msg) {
 
 static int g_verbose = 0;
 static int g_read_only = 0;
+static int g_interactive_tty = 0;
 
 static void vlog(const char *fmt, ...) {
   if (!g_verbose) return;
@@ -696,7 +697,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
       return 1;
     }
 #ifdef __NR_getpgrp
-    if (nr == __NR_getpgrp) {
+    if (!g_interactive_tty && nr == __NR_getpgrp) {
       regs->orig_rax = __NR_getpid;
       if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
       pending_clear(pend);
@@ -707,7 +708,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     }
 #endif
 #ifdef __NR_getpgid
-    if (nr == __NR_getpgid) {
+    if (!g_interactive_tty && nr == __NR_getpgid) {
       pid_t q = (pid_t)regs->rdi;
       if (q == 0 || (virt_pid && q == *virt_pid)) {
         regs->orig_rax = __NR_getpid;
@@ -722,7 +723,7 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     }
 #endif
 #ifdef __NR_getsid
-    if (nr == __NR_getsid) {
+    if (!g_interactive_tty && nr == __NR_getsid) {
       pid_t q = (pid_t)regs->rdi;
       if (q == 0 || (virt_pid && q == *virt_pid)) {
         regs->orig_rax = __NR_getpid;
@@ -4001,6 +4002,7 @@ int main(int argc, char **argv) {
   int sock = connect_tcp(host, port);
   if (sock < 0) die("connect");
   vlog("[rsys] connected to %s:%s\n", host, port);
+  g_interactive_tty = isatty(0);
 
   uint8_t *remote_env_blob = NULL;
   uint32_t remote_env_len = 0;
