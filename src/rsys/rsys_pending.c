@@ -13,6 +13,17 @@ void pending_clear(struct pending_sys *p) {
   p->map_remote_fd0 = -1;
   p->map_remote_fd1 = -1;
   p->map_pair_addr = 0;
+  p->close_remote_on_fail = 0;
+  p->close_remote_fd = -1;
+  p->mark_portfw_on_exit = 0;
+  p->mark_portfw_fd = -1;
+  p->mark_portfw_local = 0;
+  p->mark_portfw_remote = 0;
+  p->rewrite_getsockname_on_exit = 0;
+  p->rewrite_getsockname_addr = 0;
+  p->rewrite_getsockname_addrlenp = 0;
+  p->rewrite_getsockname_local = 0;
+  p->rewrite_getsockname_remote = 0;
   if (p->outs) {
     for (size_t i = 0; i < p->outs_n; i++) {
       free(p->outs[i].bytes);

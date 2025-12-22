@@ -43,6 +43,7 @@ Expose a local path at a different path for the traced program (repeatable):
 Client options (see `rsys -h` for the authoritative list):
 - `-v, --verbose`: verbose logging
 - `-m, --mount SRC:DST`: expose local `SRC` at path `DST`
+- `-p PORT|LOCAL:REMOTE`: forward remote listen port to local port
 - `-R, --read-only`: block remote filesystem mutations
 - `-e`: use local environment for the traced program
 - `-E`: use remote environment for the traced program (default)

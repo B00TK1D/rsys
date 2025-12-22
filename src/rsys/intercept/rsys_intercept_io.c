@@ -23,6 +23,8 @@ int rsys_intercept_io(struct rsys_intercept_ctx *ctx, long nr) {
   struct remote_refs *rrefs = ctx->rrefs;
   int *local_base = ctx->local_base;
   size_t local_base_n = ctx->local_base_n;
+  uint32_t *portfw_fd = ctx->portfw_fd;
+  size_t portfw_fd_n = ctx->portfw_fd_n;
   struct epoll_table *ep = ctx->ep;
   struct pending_sys *pend = ctx->pend;
 
@@ -70,6 +72,9 @@ int rsys_intercept_io(struct rsys_intercept_ctx *ctx, long nr) {
     if (local_base && fd_local >= 0 && (size_t)fd_local < local_base_n) {
       local_base[fd_local] = -1;
     }
+    if (portfw_fd && fd_local >= 0 && (size_t)fd_local < portfw_fd_n) {
+      portfw_fd[fd_local] = 0;
+    }
 
     // Let the real close(2) run so placeholder FDs are actually closed.
     return 0;
@@ -108,6 +113,11 @@ int rsys_intercept_io(struct rsys_intercept_ctx *ctx, long nr) {
       unsigned int stop = last;
       if (stop >= local_base_n) stop = (unsigned int)(local_base_n - 1);
       for (unsigned int fd = first; fd <= stop; fd++) local_base[fd] = -1;
+    }
+    if (portfw_fd && (flags & CLOSE_RANGE_CLOEXEC) == 0) {
+      unsigned int stop = last;
+      if (stop >= portfw_fd_n) stop = (unsigned int)(portfw_fd_n - 1);
+      for (unsigned int fd = first; fd <= stop; fd++) portfw_fd[fd] = 0;
     }
     return 0;
   }

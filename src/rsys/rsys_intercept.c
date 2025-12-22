@@ -7,7 +7,8 @@
 int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct fd_map *fm, struct remote_refs *rrefs,
                       const struct mounts *mnts, int *cwd_is_local, int *cwd_remote_known, char *cwd_remote, size_t cwd_remote_sz,
                       int *virt_ids_known, pid_t *virt_pid, pid_t *virt_tid, pid_t *virt_ppid, pid_t *virt_pgid, pid_t *virt_sid,
-                      int *local_base, size_t local_base_n, struct epoll_table *ep, struct pending_sys *pend) {
+                      int *local_base, size_t local_base_n, uint32_t *portfw_fd, size_t portfw_fd_n,
+                      const struct port_forwards *pfw_cfg, struct epoll_table *ep, struct pending_sys *pend) {
   long nr = (long)regs->orig_rax;
 
   struct rsys_intercept_ctx ctx = {
@@ -17,6 +18,7 @@ int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct
       .fm = fm,
       .rrefs = rrefs,
       .mnts = mnts,
+      .pfw_cfg = pfw_cfg,
       .cwd_is_local = cwd_is_local,
       .cwd_remote_known = cwd_remote_known,
       .cwd_remote = cwd_remote,
@@ -29,6 +31,8 @@ int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct
       .virt_sid = virt_sid,
       .local_base = local_base,
       .local_base_n = local_base_n,
+      .portfw_fd = portfw_fd,
+      .portfw_fd_n = portfw_fd_n,
       .ep = ep,
       .pend = pend,
   };

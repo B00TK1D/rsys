@@ -10,6 +10,7 @@ struct rsys_intercept_ctx {
   struct fd_map *fm;
   struct remote_refs *rrefs;
   const struct mounts *mnts;
+  const struct port_forwards *pfw_cfg;
 
   int *cwd_is_local;
   int *cwd_remote_known;
@@ -25,6 +26,9 @@ struct rsys_intercept_ctx {
 
   int *local_base;
   size_t local_base_n;
+
+  uint32_t *portfw_fd;
+  size_t portfw_fd_n;
 
   struct epoll_table *ep;
   struct pending_sys *pend;

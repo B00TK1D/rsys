@@ -9,6 +9,7 @@ struct fd_table *fdtable_new(void) {
   fdmap_init(&t->map);
   t->refs = 1;
   for (size_t i = 0; i < 4096; i++) t->local_base[i] = (int)i;
+  for (size_t i = 0; i < 4096; i++) t->portfw[i] = 0;
   epoll_table_init(&t->ep);
   return t;
 }
@@ -22,6 +23,7 @@ struct fd_table *fdtable_fork_clone(const struct fd_table *parent, struct remote
     return NULL;
   }
   memcpy(t->local_base, parent->local_base, sizeof(t->local_base));
+  memcpy(t->portfw, parent->portfw, sizeof(t->portfw));
   // Fork: child gets a copy of the local epoll table.
   epoll_table_init(&t->ep);
   for (size_t i = 0; i < parent->ep.n; i++) {

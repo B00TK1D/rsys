@@ -14,10 +14,42 @@
 #include <unistd.h>
 
 #include <sys/eventfd.h>
+
+static int rsys_rewrite_sockaddr_port(struct rsys_intercept_ctx *ctx, uintptr_t *reg_ptr, const void *addr, uint32_t addrlen,
+                                      uint16_t new_port_host) {
+  if (!ctx || !ctx->regs || !reg_ptr || !addr || addrlen < 4u) return -1;
+  if (addrlen > RSYS_MAX_ADDR) addrlen = RSYS_MAX_ADDR;
+  uint8_t buf[RSYS_MAX_ADDR];
+  memcpy(buf, addr, addrlen);
+  uint16_t fam = (uint16_t)(buf[0] | ((uint16_t)buf[1] << 8));
+  if (fam != AF_INET && fam != AF_INET6) return -1;
+  uint16_t np = htons(new_port_host);
+  memcpy(buf + 2, &np, 2);
+
+  uintptr_t scratch = (uintptr_t)((ctx->regs->rsp - 0x5000) & ~(uintptr_t)0xFul);
+  if (rsys_write_mem(ctx->pid, scratch, buf, addrlen) < 0) return -1;
+  *reg_ptr = scratch;
+  return 0;
+}
+
+static int rsys_sockaddr_get_port_host(const void *addr, uint32_t addrlen, uint16_t *out_port) {
+  if (!addr || addrlen < 4u || !out_port) return 0;
+  const uint8_t *b = (const uint8_t *)addr;
+  uint16_t fam = (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+  if (fam != AF_INET && fam != AF_INET6) return 0;
+  uint16_t pn = 0;
+  memcpy(&pn, b + 2, 2);
+  *out_port = ntohs(pn);
+  return 1;
+}
+
 int rsys_intercept_net_basic(struct rsys_intercept_ctx *ctx, long nr) {
   pid_t pid = ctx->pid;
   struct user_regs_struct *regs = ctx->regs;
   int sock = ctx->sock;
+  struct port_forwards const *pfw_cfg = ctx->pfw_cfg;
+  uint32_t *portfw_fd = ctx->portfw_fd;
+  size_t portfw_fd_n = ctx->portfw_fd_n;
   struct pending_sys *pend = ctx->pend;
   const uint32_t MAX_BLOB = RSYS_MAX_BLOB;
   const uint32_t MAX_ADDR = RSYS_MAX_ADDR;
@@ -29,7 +61,7 @@ int rsys_intercept_net_basic(struct rsys_intercept_ctx *ctx, long nr) {
     int type = (int)regs->rsi;
     int protocol = (int)regs->rdx;
 
-    vlog("[rsys] socket(domain=%d, type=%d, proto=%d) -> remote\n", domain, type, protocol);
+    vlog("[rsys] socket(domain=%d, type=%d, proto=%d) -> remote (local placeholder)\n", domain, type, protocol);
 
     uint8_t req[24];
     rsys_put_s64(req + 0, (int64_t)domain);
@@ -45,28 +77,29 @@ int rsys_intercept_net_basic(struct rsys_intercept_ctx *ctx, long nr) {
     int64_t rr = rsys_resp_raw_ret(&resp);
     int32_t eno = rsys_resp_err_no(&resp);
     int64_t rax = raw_sys_ret(rr, eno);
+    if (rr >= 0) {
+      pending_clear(pend);
+      pend->active = 1;
+      pend->nr = nr;
+      pend->has_set_rax = 0;     // keep kernel local socket fd (placeholder)
+      pend->map_fd_on_exit = 1;  // map local_fd -> remote_fd on syscall exit
+      pend->map_remote_fd = (int)rr;
+      pend->close_remote_on_fail = 1;
+      pend->close_remote_fd = (int)rr;
+      // Let the real socket(2) run in the tracee to produce a real socket fd,
+      // so we can later choose to run bind/listen locally for port forwarding.
+      return 0;
+    }
+
+    // Failure: replace syscall with harmless getpid and set error on exit.
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
-    pend->close_local_fd = -1;
-
-    if (rr >= 0) {
-      pend->has_set_rax = 0;
-      pend->map_fd_on_exit = 1;
-      pend->map_remote_fd = (int)rr;
-
-      regs->orig_rax = __NR_eventfd2;
-      regs->rdi = 0;
-      regs->rsi = (uint64_t)EFD_CLOEXEC;
-      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-      vlog("[rsys] socket -> raw_ret=%" PRId64 " errno=%d mapped_local_fd=<eventfd2>\n", rr, eno);
-    } else {
-      pend->has_set_rax = 1;
-      pend->set_rax = rax;
-      regs->orig_rax = __NR_getpid;
-      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-      vlog("[rsys] socket -> raw_ret=%" PRId64 " errno=%d mapped_local_fd=%" PRId64 "\n", rr, eno, rax);
-    }
+    pend->has_set_rax = 1;
+    pend->set_rax = rax;
+    regs->orig_rax = __NR_getpid;
+    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    vlog("[rsys] socket -> raw_ret=%" PRId64 " errno=%d mapped_local_fd=%" PRId64 "\n", rr, eno, rax);
     return 1;
   }
 
@@ -226,6 +259,39 @@ int rsys_intercept_net_basic(struct rsys_intercept_ctx *ctx, long nr) {
       if (rsys_read_mem(pid, addr, addr_addr, addrlen) < 0) {
         free(addr);
         return 0;
+      }
+    }
+
+    // Port forwarding: if the bind targets a forwarded remote port, run bind locally instead.
+    if (addr && addrlen >= 4u && pfw_cfg && pfw_cfg->n > 0) {
+      uint16_t remote_port = 0;
+      if (rsys_sockaddr_get_port_host(addr, addrlen, &remote_port)) {
+        uint16_t local_port = 0;
+        if (remote_port != 0 && portfw_lookup_local(pfw_cfg, remote_port, &local_port)) {
+          vlog("[rsys] bind(fd=%d, port=%u) -> local (portfw to local_port=%u)\n", fd_local, (unsigned)remote_port, (unsigned)local_port);
+          // Drop remote mapping for this socket: it is becoming a local listener.
+          fdmap_remove_all_local_and_close(ctx->fm, ctx->rrefs, sock, fd_local);
+          if (portfw_fd && fd_local >= 0 && (size_t)fd_local < portfw_fd_n) portfw_fd[fd_local] = 0;
+
+          // Rewrite port in sockaddr (don't mutate original memory).
+          if (local_port != remote_port) {
+            if (rsys_rewrite_sockaddr_port(ctx, (uintptr_t *)&regs->rsi, addr, addrlen, local_port) == 0) {
+              regs->rdx = (uint64_t)addrlen;
+              if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+            }
+          }
+
+          pending_clear(pend);
+          pend->active = 1;
+          pend->nr = nr;
+          pend->has_set_rax = 0; // keep local bind return value
+          pend->mark_portfw_on_exit = 1;
+          pend->mark_portfw_fd = fd_local;
+          pend->mark_portfw_local = local_port;
+          pend->mark_portfw_remote = remote_port;
+          free(addr);
+          return 0; // let kernel bind locally
+        }
       }
     }
 
@@ -528,7 +594,25 @@ int rsys_intercept_net_basic(struct rsys_intercept_ctx *ctx, long nr) {
     uintptr_t addr_addr = (uintptr_t)regs->rsi;
     uintptr_t addrlenp = (uintptr_t)regs->rdx;
     int fd_remote = rsys_map_fd(ctx, fd_local);
-    if (fd_remote < 0) return 0;
+    if (fd_remote < 0) {
+      // If this is a local forwarded listening socket, let kernel do getsockname
+      // but rewrite the returned port back to the "remote" port for transparency.
+      if (nr == __NR_getsockname && portfw_fd && fd_local >= 0 && (size_t)fd_local < portfw_fd_n && portfw_fd[fd_local] != 0) {
+        uint32_t enc = portfw_fd[fd_local];
+        uint16_t lp = (uint16_t)(enc >> 16);
+        uint16_t rp = (uint16_t)(enc & 0xFFFFu);
+        pending_clear(pend);
+        pend->active = 1;
+        pend->nr = nr;
+        pend->has_set_rax = 0; // keep local return, we'll only patch memory
+        pend->rewrite_getsockname_on_exit = 1;
+        pend->rewrite_getsockname_addr = addr_addr;
+        pend->rewrite_getsockname_addrlenp = addrlenp;
+        pend->rewrite_getsockname_local = lp;
+        pend->rewrite_getsockname_remote = rp;
+      }
+      return 0;
+    }
 
     if (!addr_addr || !addrlenp) return 0;
     uint32_t addr_max = 0;

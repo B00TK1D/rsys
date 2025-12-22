@@ -44,6 +44,22 @@ void mounts_free(struct mounts *m);
 int mounts_add(struct mounts *m, const char *spec);
 int mount_translate_alloc(const struct mounts *m, const char *path, char **out_local);
 
+// Port forwarding: treat bind/listen on selected remote ports as local.
+// Spec syntax: -p PORT or -p LOCAL:REMOTE (may be repeated)
+struct port_forward {
+  uint16_t local_port;
+  uint16_t remote_port;
+};
+struct port_forwards {
+  struct port_forward *v;
+  size_t n;
+  size_t cap;
+};
+void portfw_init(struct port_forwards *p);
+void portfw_free(struct port_forwards *p);
+int portfw_add(struct port_forwards *p, const char *spec);
+int portfw_lookup_local(const struct port_forwards *p, uint16_t remote_port, uint16_t *out_local_port);
+
 // RPC helpers.
 int connect_tcp(const char *host, const char *port_str);
 int rsys_call(int sock, uint16_t type, const uint8_t *req, uint32_t req_len, struct rsys_resp *out_resp, uint8_t **out_data,
@@ -110,6 +126,23 @@ struct pending_sys {
   int map_remote_fd1;
   uintptr_t map_pair_addr;
 
+  // If set, close this remote fd on syscall-exit when syscall failed (regs.rax < 0).
+  int close_remote_on_fail;
+  int close_remote_fd;
+
+  // For local bind(2) on a forwarded port: if bind succeeds, mark fd as forwarded.
+  int mark_portfw_on_exit;
+  int mark_portfw_fd;
+  uint16_t mark_portfw_local;
+  uint16_t mark_portfw_remote;
+
+  // For local getsockname(2) on forwarded listening sockets: rewrite returned port.
+  int rewrite_getsockname_on_exit;
+  uintptr_t rewrite_getsockname_addr;
+  uintptr_t rewrite_getsockname_addrlenp;
+  uint16_t rewrite_getsockname_local;
+  uint16_t rewrite_getsockname_remote;
+
   struct out_write {
     uintptr_t addr;
     uint8_t *bytes;
@@ -160,6 +193,8 @@ struct fd_table {
   struct fd_map map;
   struct epoll_table ep;
   int local_base[4096];
+  // Per-fd port forwarding state: 0 means none, otherwise (local<<16 | remote).
+  uint32_t portfw[4096];
 };
 struct proc_state {
   pid_t pid;
@@ -195,5 +230,6 @@ void proctab_del(struct proc_tab *t, pid_t pid, int sock, struct remote_refs *rr
 int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock, struct fd_map *fm, struct remote_refs *rrefs,
                       const struct mounts *mnts, int *cwd_is_local, int *cwd_remote_known, char *cwd_remote, size_t cwd_remote_sz,
                       int *virt_ids_known, pid_t *virt_pid, pid_t *virt_tid, pid_t *virt_ppid, pid_t *virt_pgid, pid_t *virt_sid,
-                      int *local_base, size_t local_base_sz, struct epoll_table *ep, struct pending_sys *pend);
+                      int *local_base, size_t local_base_sz, uint32_t *portfw_fd, size_t portfw_fd_n,
+                      const struct port_forwards *pfw_cfg, struct epoll_table *ep, struct pending_sys *pend);
 

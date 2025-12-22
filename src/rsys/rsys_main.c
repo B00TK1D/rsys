@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -38,6 +39,7 @@ static void usage(FILE *out, const char *argv0) {
           "options:\n"
           "  -v, --verbose          verbose logging\n"
           "  -m, --mount SRC:DST     expose local SRC at path DST (may be repeated)\n"
+          "  -p PORT|LOCAL:REMOTE   forward remote listen port to local port (may be repeated)\n"
           "  -R, --read-only         block remote filesystem mutations\n"
           "  -e                     use local environment for the traced program\n"
           "  -E                     use remote environment for the traced program (default)\n"
@@ -50,6 +52,8 @@ int rsys_main(int argc, char **argv) {
   int use_remote_env = 1; // default
   struct mounts mnts;
   mounts_init(&mnts);
+  struct port_forwards pfw;
+  portfw_init(&pfw);
   while (argi < argc) {
     const char *a = argv[argi];
     if (strcmp(a, "-v") == 0 || strcmp(a, "--verbose") == 0) {
@@ -65,6 +69,22 @@ int rsys_main(int argc, char **argv) {
       }
       if (mounts_add(&mnts, argv[argi + 1]) < 0) {
         fprintf(stderr, "invalid mount spec: %s\n", argv[argi + 1]);
+        mounts_free(&mnts);
+        return 2;
+      }
+      argi += 2;
+      continue;
+    }
+    if (strcmp(a, "-p") == 0) {
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing argument for %s\n", a);
+        portfw_free(&pfw);
+        mounts_free(&mnts);
+        return 2;
+      }
+      if (portfw_add(&pfw, argv[argi + 1]) < 0) {
+        fprintf(stderr, "invalid port forward spec: %s\n", argv[argi + 1]);
+        portfw_free(&pfw);
         mounts_free(&mnts);
         return 2;
       }
@@ -93,7 +113,10 @@ int rsys_main(int argc, char **argv) {
     break;
   }
   if (argc - argi < 3) {
+    fprintf(stderr, "missing required arguments: <server_ip_or_host> <port> <prog> [args...]\n");
+    fprintf(stderr, "note: `-p` configures port forwarding, not the rsysd server port.\n");
     usage(stderr, argv[0]);
+    portfw_free(&pfw);
     mounts_free(&mnts);
     return 2;
   }
@@ -247,28 +270,34 @@ int rsys_main(int argc, char **argv) {
       if (!ps->in_syscall) {
         (void)intercept_syscall(pid, &regs, sock, &ps->fdt->map, &rr, &mnts, &ps->cwd_is_local, &ps->cwd_remote_known,
                                 ps->cwd_remote, sizeof(ps->cwd_remote), &ps->virt_ids_known, &ps->virt_pid, &ps->virt_tid,
-                                &ps->virt_ppid, &ps->virt_pgid, &ps->virt_sid, ps->fdt->local_base, 4096, &ps->fdt->ep,
-                                &ps->pend);
+                                &ps->virt_ppid, &ps->virt_pgid, &ps->virt_sid, ps->fdt->local_base, 4096, ps->fdt->portfw, 4096,
+                                &pfw, &ps->fdt->ep, &ps->pend);
         ps->in_syscall = 1;
       } else {
         if (ps->pend.active) {
+          int64_t sysret = (int64_t)regs.rax;
           for (size_t i = 0; i < ps->pend.outs_n; i++) {
             if (ps->pend.outs[i].bytes && ps->pend.outs[i].len) {
               (void)rsys_write_mem(pid, ps->pend.outs[i].addr, ps->pend.outs[i].bytes, ps->pend.outs[i].len);
             }
           }
 
+          // If a syscall failed after we created a remote fd, close it (best-effort).
+          if (ps->pend.close_remote_on_fail && sysret < 0 && ps->pend.close_remote_fd >= 0) {
+            remote_close_best_effort(sock, ps->pend.close_remote_fd);
+          }
+
           // Track local epoll instances created by the tracee.
-          if (ps->pend.track_epoll_create && (int64_t)regs.rax >= 0) {
-            int epfd_local = (int)regs.rax;
+          if (ps->pend.track_epoll_create && sysret >= 0) {
+            int epfd_local = (int)sysret;
             if (epoll_table_add(&ps->fdt->ep, epfd_local) == 0) {
               vlog("[rsys] epoll_create1 -> local epfd=%d (virtual remote watches enabled)\n", epfd_local);
             }
           }
 
           // If we created placeholder FD(s), map them to remote FD(s) on syscall exit.
-          if (ps->pend.map_fd_on_exit && (int64_t)regs.rax >= 0) {
-            int local_fd = (int)regs.rax;
+          if (ps->pend.map_fd_on_exit && sysret >= 0) {
+            int local_fd = (int)sysret;
             int remote_fd = ps->pend.map_remote_fd;
             vlog("[rsys] map placeholder fd=%d -> remote_fd=%d\n", local_fd, remote_fd);
             // If the local fd number is being reused, ensure no stale mapping remains.
@@ -283,7 +312,7 @@ int rsys_main(int argc, char **argv) {
             }
           }
 
-          if (ps->pend.map_fd_pair_on_exit && (int64_t)regs.rax >= 0) {
+          if (ps->pend.map_fd_pair_on_exit && sysret >= 0) {
             int32_t sv[2] = {-1, -1};
             if (ps->pend.map_pair_addr) {
               (void)rsys_read_mem(pid, sv, (uintptr_t)ps->pend.map_pair_addr, sizeof(sv));
@@ -310,6 +339,41 @@ int rsys_main(int argc, char **argv) {
             }
           }
 
+          // If a local bind succeeded on a forwarded port, record per-fd mapping for later getsockname rewriting.
+          if (ps->pend.mark_portfw_on_exit && sysret == 0) {
+            int lfd = ps->pend.mark_portfw_fd;
+            if (lfd >= 0 && lfd < 4096) {
+              uint32_t enc = ((uint32_t)ps->pend.mark_portfw_local << 16) | (uint32_t)ps->pend.mark_portfw_remote;
+              ps->fdt->portfw[lfd] = enc;
+              vlog("[rsys] portfw: fd=%d remote_port=%u -> local_port=%u\n", lfd, (unsigned)ps->pend.mark_portfw_remote,
+                   (unsigned)ps->pend.mark_portfw_local);
+            }
+          }
+
+          // For local getsockname on forwarded sockets, rewrite returned port to remote_port.
+          if (ps->pend.rewrite_getsockname_on_exit && sysret == 0) {
+            uint32_t alen = 0;
+            if (ps->pend.rewrite_getsockname_addr && ps->pend.rewrite_getsockname_addrlenp &&
+                rsys_read_mem(pid, &alen, ps->pend.rewrite_getsockname_addrlenp, sizeof(alen)) == 0) {
+              if (alen > 128u) alen = 128u;
+              uint8_t sb[128];
+              if (alen >= 2u && rsys_read_mem(pid, sb, ps->pend.rewrite_getsockname_addr, (size_t)alen) == 0) {
+                uint16_t fam = (uint16_t)(sb[0] | ((uint16_t)sb[1] << 8));
+                if (fam == AF_INET && alen >= 4u) {
+                  // sockaddr_in: port at offset 2
+                  uint16_t rp = htons(ps->pend.rewrite_getsockname_remote);
+                  memcpy(sb + 2, &rp, 2);
+                  (void)rsys_write_mem(pid, ps->pend.rewrite_getsockname_addr, sb, (size_t)alen);
+                } else if (fam == AF_INET6 && alen >= 4u) {
+                  // sockaddr_in6: port at offset 2
+                  uint16_t rp = htons(ps->pend.rewrite_getsockname_remote);
+                  memcpy(sb + 2, &rp, 2);
+                  (void)rsys_write_mem(pid, ps->pend.rewrite_getsockname_addr, sb, (size_t)alen);
+                }
+              }
+            }
+          }
+
           if (ps->pend.has_set_rax) regs.rax = (uint64_t)ps->pend.set_rax;
           if (ptrace(PTRACE_SETREGS, pid, 0, &regs) < 0) die("PTRACE_SETREGS");
           pending_clear(&ps->pend);
@@ -328,6 +392,8 @@ int rsys_main(int argc, char **argv) {
               int base = ps->fdt->local_base[oldfd];
               if (base < 0) base = oldfd;
               ps->fdt->local_base[newfd] = base;
+              // Propagate port-forward state across dup for local fds.
+              if (ps->fdt->portfw[oldfd] != 0) ps->fdt->portfw[newfd] = ps->fdt->portfw[oldfd];
               vlog("[rsys] local alias: fd=%d -> base=%d (from dup)\n", newfd, base);
             }
           }
@@ -385,6 +451,7 @@ int rsys_main(int argc, char **argv) {
   free(procs.v);
   free(remote_envp);
   free(remote_env_blob);
+  portfw_free(&pfw);
   mounts_free(&mnts);
   return 0;
 }
