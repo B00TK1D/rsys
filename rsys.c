@@ -20,7 +20,6 @@
 #include <sys/ptrace.h>
 #include <sys/reg.h>
 #include <sys/syscall.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/user.h>
@@ -64,8 +63,8 @@ static void usage(FILE *out, const char *argv0) {
           "\n"
           "options:\n"
           "  -v, --verbose          verbose logging\n"
-          "  -m, --mount SRC:DST    expose local SRC at path DST (may be repeated)\n"
-          "  -R, --read-only        block remote filesystem mutations\n"
+          "  -m, --mount SRC:DST     expose local SRC at path DST (may be repeated)\n"
+          "  -R, --read-only         block remote filesystem mutations\n"
           "  -e                     use local environment for the traced program\n"
           "  -E                     use remote environment for the traced program (default)\n"
           "  -h, -?, --help         show this help\n",
@@ -394,24 +393,6 @@ static int fdmap_find_remote(const struct fd_map *m, int local_fd) {
   return -1;
 }
 
-static int fdmap_add_remote(struct fd_map *m, struct remote_refs *rrefs, int remote_fd) {
-  if (m->n == m->cap) {
-    size_t ncap = m->cap ? (m->cap * 2) : 16;
-    struct fd_map_ent *nv = (struct fd_map_ent *)realloc(m->v, ncap * sizeof(*nv));
-    if (!nv) return -1;
-    m->v = nv;
-    m->cap = ncap;
-  }
-  int lfd = m->next_local++;
-  m->v[m->n++] = (struct fd_map_ent){.local_fd = lfd, .remote_fd = remote_fd};
-  if (rrefs_inc(rrefs, remote_fd) < 0) {
-    // Roll back mapping on failure to track refs.
-    m->n--;
-    return -1;
-  }
-  return lfd;
-}
-
 static int fdmap_add_existing(struct fd_map *m, struct remote_refs *rrefs, int local_fd, int remote_fd) {
   if (local_fd < 0) return -1;
   if (m->n == m->cap) {
@@ -464,16 +445,6 @@ static int fdmap_clone(struct fd_map *dst, const struct fd_map *src, struct remo
     }
   }
   return 0;
-}
-
-static void remote_close_best_effort(int sock, int remote_fd) {
-  uint8_t req[8];
-  rsys_put_s64(req + 0, (int64_t)remote_fd);
-  struct rsys_resp resp;
-  uint8_t *data = NULL;
-  uint32_t data_len = 0;
-  if (rsys_call(sock, RSYS_REQ_CLOSE, req, sizeof(req), &resp, &data, &data_len) < 0) return;
-  free(data);
 }
 
 static int connect_tcp(const char *host, const char *port_str) {
@@ -604,15 +575,22 @@ static void maybe_make_remote_abs_path(char *path, size_t path_sz, const int *cw
 struct pending_sys {
   int active;
   long nr;
-  int has_set_rax;
 
   // For emulation on syscall-exit
+  int has_set_rax;
   int64_t set_rax;
 
-  // For syscalls we rewrite to return a locally-created placeholder FD:
-  // if set, at syscall-exit we map regs->rax (local fd) to map_remote_fd.
+  // For syscalls we rewrite to create a local placeholder FD:
+  // - map_fd_on_exit: map regs->rax (local fd) to map_remote_fd after syscall exits
   int map_fd_on_exit;
   int map_remote_fd;
+
+  // For syscalls we rewrite to create a local placeholder FD pair via pipe2():
+  // - map_fd_pair_on_exit: map two local fds from map_pair_addr to remote fds.
+  int map_fd_pair_on_exit;
+  int map_remote_fd0;
+  int map_remote_fd1;
+  uintptr_t map_pair_addr;
 
   // Buffers to write into tracee on exit (supports multiple writes)
   struct out_write {
@@ -634,6 +612,10 @@ static void pending_clear(struct pending_sys *p) {
   p->set_rax = 0;
   p->map_fd_on_exit = 0;
   p->map_remote_fd = -1;
+  p->map_fd_pair_on_exit = 0;
+  p->map_remote_fd0 = -1;
+  p->map_remote_fd1 = -1;
+  p->map_pair_addr = 0;
   if (p->outs) {
     for (size_t i = 0; i < p->outs_n; i++) {
       free(p->outs[i].bytes);
@@ -686,7 +668,6 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
   const uint32_t MAX_ADDR = 512;          // sockaddr cap
   const uint32_t MAX_CTRL = 64u * 1024u;  // cmsg cap
   const uint32_t MAX_IOV = 128;           // iov count cap
-  const uint32_t MAX_SELECT_FDS = 4096;   // cap select() nfds
 
   // Local mount remapping for absolute path arguments.
   auto int maybe_remap_path(uintptr_t addr, uintptr_t *reg_ptr) {
@@ -705,309 +686,6 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     }
     free(lp);
     return (rc == 0) ? 1 : 0;
-  }
-
-  auto uint32_t fdset_bytes(uint64_t nfds) {
-    if (nfds == 0) return 0;
-    uint64_t bits_per_word = (uint64_t)(8u * sizeof(unsigned long));
-    uint64_t words = (nfds + bits_per_word - 1) / bits_per_word;
-    uint64_t bytes = words * (uint64_t)sizeof(unsigned long);
-    if (bytes > 1u << 20) bytes = 1u << 20;
-    return (uint32_t)bytes;
-  }
-
-  auto int bit_test(const uint8_t *set, uint32_t bytes, uint32_t fd) {
-    uint32_t bit = fd;
-    uint32_t byte = bit / 8u;
-    if (!set || byte >= bytes) return 0;
-    return (set[byte] >> (bit & 7u)) & 1u;
-  }
-
-  auto void bit_set(uint8_t *set, uint32_t bytes, uint32_t fd) {
-    uint32_t bit = fd;
-    uint32_t byte = bit / 8u;
-    if (!set || byte >= bytes) return;
-    set[byte] |= (uint8_t)(1u << (bit & 7u));
-  }
-
-  // select(nfds, readfds, writefds, exceptfds, timeout)
-  if (nr == __NR_select || nr == __NR_pselect6) {
-    uint64_t nfds = (uint64_t)regs->rdi;
-    uintptr_t r_addr = (uintptr_t)regs->rsi;
-    uintptr_t w_addr = (uintptr_t)regs->rdx;
-    uintptr_t e_addr = (uintptr_t)regs->r10;
-    uintptr_t tmo_addr = (uintptr_t)regs->r8;
-    uintptr_t psel_addr = (uintptr_t)regs->r9; // pselect6 only
-
-    if (nfds > MAX_SELECT_FDS) nfds = MAX_SELECT_FDS;
-    if (nfds == 0) return 0;
-
-    uint32_t set_bytes = fdset_bytes(nfds);
-    uint8_t *rset = NULL, *wset = NULL, *eset = NULL;
-    if (r_addr && set_bytes) {
-      rset = (uint8_t *)calloc(1, set_bytes);
-      if (!rset) die("calloc");
-      if (rsys_read_mem(pid, rset, r_addr, set_bytes) < 0) goto sel_local;
-    }
-    if (w_addr && set_bytes) {
-      wset = (uint8_t *)calloc(1, set_bytes);
-      if (!wset) die("calloc");
-      if (rsys_read_mem(pid, wset, w_addr, set_bytes) < 0) goto sel_local;
-    }
-    if (e_addr && set_bytes) {
-      eset = (uint8_t *)calloc(1, set_bytes);
-      if (!eset) die("calloc");
-      if (rsys_read_mem(pid, eset, e_addr, set_bytes) < 0) goto sel_local;
-    }
-
-    // Determine if any fd in the sets is remote-mapped.
-    int any_remote = 0;
-    for (uint32_t fd = 0; fd < (uint32_t)nfds; fd++) {
-      int in = bit_test(rset, set_bytes, fd) || bit_test(wset, set_bytes, fd) || bit_test(eset, set_bytes, fd);
-      if (!in) continue;
-      if (map_fd((int)fd) >= 0) {
-        any_remote = 1;
-        break;
-      }
-    }
-    if (!any_remote) goto sel_local;
-
-    // Timeout handling
-    int has_tmo = (tmo_addr != 0) ? 1 : 0;
-    int is_select = (nr == __NR_select);
-    int64_t remaining_ns = -1;
-    struct timeval tv0;
-    struct timespec ts0;
-    if (has_tmo) {
-      if (is_select) {
-        if (rsys_read_mem(pid, &tv0, tmo_addr, sizeof(tv0)) < 0) goto sel_local;
-        remaining_ns = (int64_t)tv0.tv_sec * 1000000000LL + (int64_t)tv0.tv_usec * 1000LL;
-      } else {
-        if (rsys_read_mem(pid, &ts0, tmo_addr, sizeof(ts0)) < 0) goto sel_local;
-        remaining_ns = (int64_t)ts0.tv_sec * 1000000000LL + (int64_t)ts0.tv_nsec;
-      }
-    }
-
-    // Optional sigmask for pselect6
-    uint32_t has_sig = 0;
-    uint32_t sigsz = 0;
-    uint8_t sigmask[128];
-    if (!is_select && psel_addr) {
-      struct {
-        uint64_t sigmask_ptr;
-        uint64_t sigsetsize;
-      } psel;
-      if (rsys_read_mem(pid, &psel, psel_addr, sizeof(psel)) < 0) goto sel_local;
-      if (psel.sigmask_ptr && psel.sigsetsize) {
-        sigsz = (uint32_t)psel.sigsetsize;
-        if (sigsz > 128) sigsz = 128;
-        if (rsys_read_mem(pid, sigmask, (uintptr_t)psel.sigmask_ptr, sigsz) < 0) goto sel_local;
-        has_sig = 1;
-      }
-    }
-
-    uint64_t start = 0;
-    if (has_tmo && remaining_ns >= 0) start = (uint64_t)remaining_ns;
-
-    // Loop: check local and remote readiness; if none, wait remotely in slices.
-    for (;;) {
-      // Local poll on local-only fds (0 timeout).
-      struct pollfd *lp = NULL;
-      size_t lp_n = 0;
-      for (uint32_t fd = 0; fd < (uint32_t)nfds; fd++) {
-        if (!(bit_test(rset, set_bytes, fd) || bit_test(wset, set_bytes, fd) || bit_test(eset, set_bytes, fd))) continue;
-        if (map_fd((int)fd) >= 0) continue; // remote-mapped
-        lp_n++;
-      }
-      if (lp_n) {
-        lp = (struct pollfd *)calloc(lp_n, sizeof(*lp));
-        if (!lp) die("calloc");
-        size_t j = 0;
-        for (uint32_t fd = 0; fd < (uint32_t)nfds; fd++) {
-          if (!(bit_test(rset, set_bytes, fd) || bit_test(wset, set_bytes, fd) || bit_test(eset, set_bytes, fd))) continue;
-          if (map_fd((int)fd) >= 0) continue;
-          short ev = 0;
-          if (bit_test(rset, set_bytes, fd)) ev |= POLLIN;
-          if (bit_test(wset, set_bytes, fd)) ev |= POLLOUT;
-          if (bit_test(eset, set_bytes, fd)) ev |= POLLPRI;
-          lp[j++] = (struct pollfd){.fd = (int)fd, .events = ev, .revents = 0};
-        }
-        (void)poll(lp, (nfds_t)lp_n, 0);
-      }
-
-      // Remote ppoll(0) check for remote-mapped fds, expressed as a pollfd list of length nfds.
-      uint32_t req_len = 32 + (uint32_t)nfds * 16 + (has_sig ? sigsz : 0);
-      uint8_t *req = (uint8_t *)malloc(req_len);
-      if (!req) die("malloc");
-      rsys_put_u32(req + 0, (uint32_t)nfds);
-      rsys_put_u32(req + 4, 1u); // has_tmo
-      rsys_put_u32(req + 8, has_sig);
-      rsys_put_u32(req + 12, sigsz);
-      rsys_put_s64(req + 16, 0);
-      rsys_put_s64(req + 24, 0);
-      uint32_t off = 32;
-      for (uint32_t fd = 0; fd < (uint32_t)nfds; fd++) {
-        short ev = 0;
-        if (bit_test(rset, set_bytes, fd)) ev |= POLLIN;
-        if (bit_test(wset, set_bytes, fd)) ev |= POLLOUT;
-        if (bit_test(eset, set_bytes, fd)) ev |= POLLPRI;
-        int rfd = -1;
-        if (ev) {
-          int m = map_fd((int)fd);
-          if (m >= 0) rfd = m;
-        }
-        rsys_put_s64(req + off + 0, (int64_t)rfd);
-        rsys_put_u32(req + off + 8, (uint32_t)(uint16_t)ev);
-        rsys_put_u32(req + off + 12, 0);
-        off += 16;
-      }
-      if (has_sig) memcpy(req + off, sigmask, sigsz);
-
-      struct rsys_resp resp;
-      uint8_t *data = NULL;
-      uint32_t data_len = 0;
-      int ok = (rsys_call(sock, RSYS_REQ_PPOLL, req, req_len, &resp, &data, &data_len) == 0);
-      free(req);
-
-      // Build output fdsets
-      uint8_t *or = r_addr ? (uint8_t *)calloc(1, set_bytes) : NULL;
-      uint8_t *ow = w_addr ? (uint8_t *)calloc(1, set_bytes) : NULL;
-      uint8_t *oe = e_addr ? (uint8_t *)calloc(1, set_bytes) : NULL;
-      if ((r_addr && !or) || (w_addr && !ow) || (e_addr && !oe)) die("calloc");
-
-      int ready_cnt = 0;
-      uint8_t *ready_any = (uint8_t *)calloc(1, set_bytes);
-      if (!ready_any) die("calloc");
-
-      // Remote revents
-      if (ok && rsys_resp_raw_ret(&resp) >= 0 && data_len == 4u + (uint32_t)nfds * 4u && rsys_get_u32(data + 0) == (uint32_t)nfds) {
-        for (uint32_t fd = 0; fd < (uint32_t)nfds; fd++) {
-          short rev = (short)(uint16_t)rsys_get_u32(data + 4 + fd * 4);
-          if (!rev) continue;
-          if (or && (rev & (POLLIN | POLLHUP | POLLERR))) bit_set(or, set_bytes, fd);
-          if (ow && (rev & (POLLOUT | POLLERR))) bit_set(ow, set_bytes, fd);
-          if (oe && (rev & (POLLPRI))) bit_set(oe, set_bytes, fd);
-          bit_set(ready_any, set_bytes, fd);
-        }
-      }
-      free(data);
-
-      // Local readiness
-      if (lp) {
-        for (size_t i = 0; i < lp_n; i++) {
-          int fd = lp[i].fd;
-          short rev = lp[i].revents;
-          if (!rev) continue;
-          if (or && (rev & (POLLIN | POLLHUP | POLLERR))) bit_set(or, set_bytes, (uint32_t)fd);
-          if (ow && (rev & (POLLOUT | POLLERR))) bit_set(ow, set_bytes, (uint32_t)fd);
-          if (oe && (rev & (POLLPRI))) bit_set(oe, set_bytes, (uint32_t)fd);
-          bit_set(ready_any, set_bytes, (uint32_t)fd);
-        }
-        free(lp);
-      }
-
-      // Count unique ready fds
-      for (uint32_t fd = 0; fd < (uint32_t)nfds; fd++) {
-        if (bit_test(ready_any, set_bytes, fd)) ready_cnt++;
-      }
-      free(ready_any);
-
-      if (ready_cnt > 0) {
-        regs->orig_rax = __NR_getpid;
-        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-        pending_clear(pend);
-        pend->active = 1;
-        pend->nr = nr;
-        pend->set_rax = ready_cnt;
-        if (or) (void)pending_add_out(pend, r_addr, or, set_bytes);
-        if (ow) (void)pending_add_out(pend, w_addr, ow, set_bytes);
-        if (oe) (void)pending_add_out(pend, e_addr, oe, set_bytes);
-
-        if (is_select && has_tmo) {
-          // Best-effort: set timeout to 0 (kernel normally sets remaining time).
-          struct timeval tvz = {.tv_sec = 0, .tv_usec = 0};
-          uint8_t *tb = (uint8_t *)malloc(sizeof(tvz));
-          if (!tb) die("malloc");
-          memcpy(tb, &tvz, sizeof(tvz));
-          (void)pending_add_out(pend, tmo_addr, tb, (uint32_t)sizeof(tvz));
-        }
-
-        free(rset);
-        free(wset);
-        free(eset);
-        return 1;
-      }
-
-      free(or);
-      free(ow);
-      free(oe);
-
-      if (has_tmo && remaining_ns <= 0) {
-        regs->orig_rax = __NR_getpid;
-        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-        pending_clear(pend);
-        pend->active = 1;
-        pend->nr = nr;
-        pend->set_rax = 0;
-        if (is_select && has_tmo) {
-          struct timeval tvz = {.tv_sec = 0, .tv_usec = 0};
-          uint8_t *tb = (uint8_t *)malloc(sizeof(tvz));
-          if (!tb) die("malloc");
-          memcpy(tb, &tvz, sizeof(tvz));
-          (void)pending_add_out(pend, tmo_addr, tb, (uint32_t)sizeof(tvz));
-        }
-        free(rset);
-        free(wset);
-        free(eset);
-        return 1;
-      }
-
-      // Wait remotely for a short slice
-      int64_t slice_ns = 20 * 1000000LL;
-      if (has_tmo && remaining_ns >= 0 && remaining_ns < slice_ns) slice_ns = remaining_ns;
-      uint64_t slice_sec = (uint64_t)(slice_ns / 1000000000LL);
-      uint64_t slice_nsec = (uint64_t)(slice_ns % 1000000000LL);
-
-      uint32_t req_len2 = 32 + (uint32_t)nfds * 16 + (has_sig ? sigsz : 0);
-      uint8_t *req2 = (uint8_t *)malloc(req_len2);
-      if (!req2) die("malloc");
-      rsys_put_u32(req2 + 0, (uint32_t)nfds);
-      rsys_put_u32(req2 + 4, 1u);
-      rsys_put_u32(req2 + 8, has_sig);
-      rsys_put_u32(req2 + 12, sigsz);
-      rsys_put_s64(req2 + 16, (int64_t)slice_sec);
-      rsys_put_s64(req2 + 24, (int64_t)slice_nsec);
-      off = 32;
-      for (uint32_t fd = 0; fd < (uint32_t)nfds; fd++) {
-        short ev = 0;
-        if (bit_test(rset, set_bytes, fd)) ev |= POLLIN;
-        if (bit_test(wset, set_bytes, fd)) ev |= POLLOUT;
-        if (bit_test(eset, set_bytes, fd)) ev |= POLLPRI;
-        int rfd = -1;
-        if (ev) {
-          int m = map_fd((int)fd);
-          if (m >= 0) rfd = m;
-        }
-        rsys_put_s64(req2 + off + 0, (int64_t)rfd);
-        rsys_put_u32(req2 + off + 8, (uint32_t)(uint16_t)ev);
-        rsys_put_u32(req2 + off + 12, 0);
-        off += 16;
-      }
-      if (has_sig) memcpy(req2 + off, sigmask, sigsz);
-      (void)rsys_call(sock, RSYS_REQ_PPOLL, req2, req_len2, &resp, &data, &data_len);
-      free(req2);
-      free(data);
-      if (has_tmo && remaining_ns >= 0) remaining_ns -= slice_ns;
-      (void)start;
-      continue;
-    }
-
-  sel_local:
-    free(rset);
-    free(wset);
-    free(eset);
-    // Let the kernel handle fully-local select/pselect.
-    return 0;
   }
 
   // chdir(path)
@@ -1174,30 +852,30 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int32_t eno = rsys_resp_err_no(&resp);
 
     int64_t rax = raw_sys_ret(rr, eno);
-
-    vlog("[rsys] openat -> raw_ret=%" PRId64 " errno=%d mapped_local_fd=%" PRId64 "\n", rr, eno, rax);
-
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
-    pend->has_set_rax = 1;
-    pend->set_rax = rax;
     pend->close_local_fd = -1;
 
     if (rr >= 0) {
       // Create a real local placeholder FD (small, non-colliding) so userland
-      // can safely use select()/FD_SET, etc. We'll map it to the remote FD on exit.
-      pend->has_set_rax = 0; // keep eventfd2's return value
+      // can safely use poll/select/FD_SET, etc. We'll map it to the remote FD on exit.
+      pend->has_set_rax = 0; // keep eventfd2 return value
       pend->map_fd_on_exit = 1;
       pend->map_remote_fd = (int)rr;
+
       regs->orig_rax = __NR_eventfd2;
       regs->rdi = 0; // initval
       regs->rsi = (uint64_t)EFD_CLOEXEC;
       if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      vlog("[rsys] openat -> raw_ret=%" PRId64 " errno=%d mapped_local_fd=<eventfd2>\n", rr, eno);
     } else {
       // Failure: replace syscall with harmless getpid and set error on exit.
+      pend->has_set_rax = 1;
+      pend->set_rax = rax;
       regs->orig_rax = __NR_getpid;
       if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      vlog("[rsys] openat -> raw_ret=%" PRId64 " errno=%d mapped_local_fd=%" PRId64 "\n", rr, eno, rax);
     }
     return 1;
   }
@@ -1216,27 +894,20 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     if (fdmap_remove_local(fm, fd_local, &removed_remote) < 0) return 0;
     uint32_t new_refs = rrefs_dec(rrefs, removed_remote);
 
-    int64_t rax = 0;
+    // Last reference: close on remote (best-effort).
     if (new_refs == 0) {
-      // Last reference: close on remote.
       vlog("[rsys] close(fd=%d -> remote_fd=%d) -> remote\n", fd_local, fd_remote);
       uint8_t req[8];
       rsys_put_s64(req + 0, (int64_t)fd_remote);
       struct rsys_resp resp;
       uint8_t *data = NULL;
       uint32_t data_len = 0;
-      if (rsys_call(sock, RSYS_REQ_CLOSE, req, sizeof(req), &resp, &data, &data_len) < 0) return 0;
+      (void)rsys_call(sock, RSYS_REQ_CLOSE, req, sizeof(req), &resp, &data, &data_len);
       free(data);
-      rax = raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp));
     }
 
     // Let the real close(2) run so placeholder FDs are actually closed.
-    pending_clear(pend);
-    pend->active = 1;
-    pend->nr = nr;
-    pend->set_rax = rax;
-    pend->close_local_fd = -1;
-    return 1;
+    return 0;
   }
 
   // read(fd, buf, count)
@@ -2131,24 +1802,23 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int64_t rr = rsys_resp_raw_ret(&resp);
     int32_t eno = rsys_resp_err_no(&resp);
     int64_t rax = raw_sys_ret(rr, eno);
-
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
-    pend->has_set_rax = 1;
-    pend->set_rax = rax;
+    pend->close_local_fd = -1;
 
     if (rr >= 0) {
-      // Create a real local placeholder FD (small, non-colliding) so userland
-      // can safely use select()/FD_SET, etc. We'll map it to the remote FD on exit.
-      pend->has_set_rax = 0; // keep eventfd2's return value
+      pend->has_set_rax = 0;
       pend->map_fd_on_exit = 1;
       pend->map_remote_fd = (int)rr;
+
       regs->orig_rax = __NR_eventfd2;
       regs->rdi = 0;
       regs->rsi = (uint64_t)EFD_CLOEXEC;
       if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
     } else {
+      pend->has_set_rax = 1;
+      pend->set_rax = rax;
       regs->orig_rax = __NR_getpid;
       if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
     }
@@ -2194,22 +1864,26 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
         int64_t rfd0 = rsys_get_s64(data + 0);
         int64_t rfd1 = rsys_get_s64(data + 8);
         free(data);
-        int lfd0 = fdmap_add_remote(fm, rrefs, (int)rfd0);
-        int lfd1 = fdmap_add_remote(fm, rrefs, (int)rfd1);
-        if (lfd0 < 0 || lfd1 < 0) {
-          pend->set_rax = -ENOMEM;
-        } else {
-          uint8_t *sv = (uint8_t *)malloc(8);
-          if (!sv) {
-            pend->set_rax = -ENOMEM;
-          } else {
-            int32_t a = lfd0;
-            int32_t b = lfd1;
-            memcpy(sv + 0, &a, 4);
-            memcpy(sv + 4, &b, 4);
-            (void)pending_add_out(pend, sv_addr, sv, 8);
-          }
-        }
+        // Allocate two local placeholder FDs via pipe2(), then map them to the remote FDs on exit.
+        // We use pipe2 because it returns two real FDs to the tracee.
+        pend->has_set_rax = 0; // keep pipe2 return value (0)
+        pend->map_fd_pair_on_exit = 1;
+        pend->map_remote_fd0 = (int)rfd0;
+        pend->map_remote_fd1 = (int)rfd1;
+        pend->map_pair_addr = sv_addr;
+
+        int pflags = 0;
+#ifdef SOCK_CLOEXEC
+        if (type & SOCK_CLOEXEC) pflags |= O_CLOEXEC;
+#endif
+#ifdef SOCK_NONBLOCK
+        if (type & SOCK_NONBLOCK) pflags |= O_NONBLOCK;
+#endif
+        regs->orig_rax = __NR_pipe2;
+        regs->rdi = (uint64_t)sv_addr;
+        regs->rsi = (uint64_t)pflags;
+        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+        return 1;
       }
     } else {
       free(data);
@@ -2372,21 +2046,25 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int64_t rr = rsys_resp_raw_ret(&resp);
     int32_t eno = rsys_resp_err_no(&resp);
     int64_t rax = raw_sys_ret(rr, eno);
-    if (rr >= 0) {
-      int local_fake = fdmap_add_remote(fm, rrefs, (int)rr);
-      if (local_fake < 0) {
-        rax = -ENOMEM;
-      } else {
-        rax = local_fake;
-      }
-    }
-
-    regs->orig_rax = __NR_getpid;
-    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
-    pend->set_rax = rax;
+    pend->close_local_fd = -1;
+
+    if (rr >= 0) {
+      pend->has_set_rax = 0;
+      pend->map_fd_on_exit = 1;
+      pend->map_remote_fd = (int)rr;
+      regs->orig_rax = __NR_eventfd2;
+      regs->rdi = 0;
+      regs->rsi = (uint64_t)EFD_CLOEXEC;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    } else {
+      pend->has_set_rax = 1;
+      pend->set_rax = rax;
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    }
 
     if (want_addr && rr >= 0) {
       if (data_len < 4) {
@@ -2915,6 +2593,184 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     return 1;
   }
 
+  // sendmmsg(fd, msgvec, vlen, flags)
+  if (nr == __NR_sendmmsg) {
+    int fd_local = (int)regs->rdi;
+    uintptr_t msgvec_addr = (uintptr_t)regs->rsi;
+    uint32_t vlen = (uint32_t)regs->rdx;
+    int flags = (int)regs->r10;
+
+    int fd_remote = map_fd(fd_local);
+    if (fd_remote < 0) return 0;
+
+    // Prepare pending state; we'll queue msg_len writes into it.
+    pending_clear(pend);
+    pend->active = 1;
+    pend->nr = nr;
+
+    if (vlen > 128) vlen = 128;
+    if (vlen == 0) {
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+      pend->set_rax = 0;
+      return 1;
+    }
+
+    uint32_t sent = 0;
+    for (uint32_t mi = 0; mi < vlen; mi++) {
+      struct mmsghdr mm;
+      if (rsys_read_mem(pid, &mm, msgvec_addr + (uintptr_t)mi * sizeof(mm), sizeof(mm)) < 0) {
+        // If we can't read, fall back to local.
+        if (sent == 0) return 0;
+        break;
+      }
+
+      struct msghdr mh = mm.msg_hdr;
+
+      uint32_t name_len = (uint32_t)mh.msg_namelen;
+      if (name_len > MAX_ADDR) name_len = MAX_ADDR;
+      uint32_t ctrl_len = (uint32_t)mh.msg_controllen;
+      if (ctrl_len > MAX_CTRL) ctrl_len = MAX_CTRL;
+      uint32_t iovcnt = (uint32_t)mh.msg_iovlen;
+      if (iovcnt > MAX_IOV) iovcnt = MAX_IOV;
+
+      uint8_t *name = NULL;
+      if (mh.msg_name && name_len) {
+        name = (uint8_t *)malloc(name_len);
+        if (!name) die("malloc");
+        if (rsys_read_mem(pid, name, (uintptr_t)mh.msg_name, name_len) < 0) {
+          free(name);
+          if (sent == 0) return 0;
+          break;
+        }
+      } else {
+        name_len = 0;
+      }
+
+      uint8_t *ctrl = NULL;
+      if (mh.msg_control && ctrl_len) {
+        ctrl = (uint8_t *)malloc(ctrl_len);
+        if (!ctrl) die("malloc");
+        if (rsys_read_mem(pid, ctrl, (uintptr_t)mh.msg_control, ctrl_len) < 0) {
+          free(name);
+          free(ctrl);
+          if (sent == 0) return 0;
+          break;
+        }
+      } else {
+        ctrl_len = 0;
+      }
+
+      struct iovec *iov = NULL;
+      if (mh.msg_iov && iovcnt) {
+        iov = (struct iovec *)malloc(iovcnt * sizeof(*iov));
+        if (!iov) die("malloc");
+        if (rsys_read_mem(pid, iov, (uintptr_t)mh.msg_iov, iovcnt * sizeof(*iov)) < 0) {
+          free(name);
+          free(ctrl);
+          free(iov);
+          if (sent == 0) return 0;
+          break;
+        }
+      } else {
+        iovcnt = 0;
+      }
+
+      uint32_t data_len = 0;
+      for (uint32_t i = 0; i < iovcnt; i++) {
+        uint64_t add = (uint64_t)iov[i].iov_len;
+        if (add > MAX_BLOB) add = MAX_BLOB;
+        if (data_len + (uint32_t)add < data_len) break;
+        uint64_t newlen = (uint64_t)data_len + add;
+        if (newlen > MAX_BLOB) {
+          data_len = MAX_BLOB;
+          break;
+        }
+        data_len = (uint32_t)newlen;
+      }
+
+      uint8_t *payload_data = NULL;
+      if (data_len) {
+        payload_data = (uint8_t *)malloc(data_len);
+        if (!payload_data) die("malloc");
+        uint32_t off = 0;
+        for (uint32_t i = 0; i < iovcnt && off < data_len; i++) {
+          uint32_t take = (uint32_t)iov[i].iov_len;
+          if (take > data_len - off) take = data_len - off;
+          if (take && rsys_read_mem(pid, payload_data + off, (uintptr_t)iov[i].iov_base, take) < 0) {
+            free(name);
+            free(ctrl);
+            free(iov);
+            free(payload_data);
+            if (sent == 0) return 0;
+            goto sendmmsg_done;
+          }
+          off += take;
+        }
+      }
+      free(iov);
+
+      uint32_t req_len = 32 + name_len + ctrl_len + data_len;
+      uint8_t *req = (uint8_t *)malloc(req_len);
+      if (!req) die("malloc");
+      rsys_put_s64(req + 0, (int64_t)fd_remote);
+      rsys_put_s64(req + 8, (int64_t)flags);
+      rsys_put_u32(req + 16, name_len);
+      rsys_put_u32(req + 20, ctrl_len);
+      rsys_put_u32(req + 24, data_len);
+      rsys_put_u32(req + 28, 0);
+      uint32_t o = 32;
+      if (name_len) memcpy(req + o, name, name_len), o += name_len;
+      if (ctrl_len) memcpy(req + o, ctrl, ctrl_len), o += ctrl_len;
+      if (data_len) memcpy(req + o, payload_data, data_len), o += data_len;
+      free(name);
+      free(ctrl);
+      free(payload_data);
+
+      struct rsys_resp resp;
+      uint8_t *odata = NULL;
+      uint32_t odata_len = 0;
+      if (rsys_call(sock, RSYS_REQ_SENDMSG, req, req_len, &resp, &odata, &odata_len) < 0) {
+        free(req);
+        free(odata);
+        if (sent == 0) return 0;
+        break;
+      }
+      free(req);
+      free(odata);
+
+      int64_t rr = rsys_resp_raw_ret(&resp);
+      int32_t eno = rsys_resp_err_no(&resp);
+      int64_t rax_one = raw_sys_ret(rr, eno);
+
+      if (rr < 0) {
+        if (sent == 0) {
+          // First one failed: return the error.
+          regs->orig_rax = __NR_getpid;
+          if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+          pend->set_rax = rax_one;
+          return 1;
+        }
+        break;
+      }
+
+      // Update msg_len for this entry.
+      uint32_t msg_len = (uint32_t)rr;
+      uint8_t *lb = (uint8_t *)malloc(4);
+      if (!lb) die("malloc");
+      memcpy(lb, &msg_len, 4);
+      uintptr_t len_addr = msgvec_addr + (uintptr_t)mi * sizeof(struct mmsghdr) + offsetof(struct mmsghdr, msg_len);
+      (void)pending_add_out(pend, len_addr, lb, 4);
+      sent++;
+    }
+
+  sendmmsg_done:
+    regs->orig_rax = __NR_getpid;
+    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    pend->set_rax = (int64_t)sent;
+    return 1;
+  }
+
   // recvmsg(fd, msg, flags)
   if (nr == __NR_recvmsg) {
     int fd_local = (int)regs->rdi;
@@ -3147,18 +3003,24 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
     int64_t rr = rsys_resp_raw_ret(&resp);
     int32_t eno = rsys_resp_err_no(&resp);
     int64_t rax = raw_sys_ret(rr, eno);
-    if (rr >= 0) {
-      int local_fake = fdmap_add_remote(fm, rrefs, (int)rr);
-      if (local_fake < 0) rax = -ENOMEM;
-      else rax = local_fake;
-    }
-
-    regs->orig_rax = __NR_getpid;
-    if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
     pending_clear(pend);
     pend->active = 1;
     pend->nr = nr;
-    pend->set_rax = rax;
+    pend->close_local_fd = -1;
+    if (rr >= 0) {
+      pend->has_set_rax = 0;
+      pend->map_fd_on_exit = 1;
+      pend->map_remote_fd = (int)rr;
+      regs->orig_rax = __NR_eventfd2;
+      regs->rdi = 0;
+      regs->rsi = (uint64_t)EFD_CLOEXEC;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    } else {
+      pend->has_set_rax = 1;
+      pend->set_rax = rax;
+      regs->orig_rax = __NR_getpid;
+      if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+    }
     return 1;
   }
 
@@ -3341,21 +3203,16 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
       return 0;
     }
 
-    // Mixed local+remote polling:
-    // If any fd is remote-mapped, we forward readiness checks for those fds to
-    // the remote ppoll(), and we check local fds using a local poll() with
-    // remote fds masked out. Then we merge the revents.
     int any_remote = 0;
+    int any_local = 0;
     for (size_t i = 0; i < (size_t)nfds; i++) {
       if (pfds[i].fd < 0) continue;
-      if (map_fd(pfds[i].fd) >= 0) {
-        any_remote = 1;
-        break;
-      }
+      if (map_fd(pfds[i].fd) >= 0) any_remote = 1;
+      else any_local = 1;
     }
     if (!any_remote) {
       free(pfds);
-      return 0; // all-local: let kernel handle it
+      return 0;
     }
 
     struct timespec tmo;
@@ -3377,36 +3234,47 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
       }
     }
 
-    uint64_t start_ns = 0;
-    if (has_tmo) start_ns = (uint64_t)tmo.tv_sec * 1000000000ull + (uint64_t)tmo.tv_nsec;
-
-    // We'll do a simple loop: check local readiness with poll(...,0), check remote readiness
-    // with ppoll(...,0). If nothing is ready, wait remotely for a short slice, and repeat.
-    // This avoids the previous behavior of falling back to local poll (which can't see remote readiness).
+    // Mixed local+remote ppoll. If there are no local fds, do a single remote call.
     int timeout_infinite = !has_tmo;
-    int64_t remaining_ns = has_tmo ? (int64_t)start_ns : -1;
+    int64_t remaining_ns = -1;
+    if (has_tmo) remaining_ns = (int64_t)tmo.tv_sec * 1000000000LL + (int64_t)tmo.tv_nsec;
+    int64_t slice_ns = any_local ? (50 * 1000000LL) : remaining_ns;
 
     for (;;) {
-      // Check local fds immediately (mask out remote-mapped fds).
-      struct pollfd *lp = (struct pollfd *)malloc((size_t)nfds * sizeof(*lp));
-      if (!lp) die("malloc");
-      memcpy(lp, pfds, (size_t)nfds * sizeof(*lp));
-      for (size_t i = 0; i < (size_t)nfds; i++) {
-        if (lp[i].fd < 0) continue;
-        if (map_fd(lp[i].fd) >= 0) lp[i].fd = -1;
+      // Local readiness check (0 timeout) for local-only fds.
+      struct pollfd *lp = NULL;
+      if (any_local) {
+        lp = (struct pollfd *)malloc((size_t)nfds * sizeof(*lp));
+        if (!lp) die("malloc");
+        memcpy(lp, pfds, (size_t)nfds * sizeof(*lp));
+        for (size_t i = 0; i < (size_t)nfds; i++) {
+          if (lp[i].fd < 0) continue;
+          if (map_fd(lp[i].fd) >= 0) lp[i].fd = -1;
+          lp[i].revents = 0;
+        }
+        (void)poll(lp, (nfds_t)nfds, 0);
       }
-      int lrc = poll(lp, (nfds_t)nfds, 0);
 
-      // Build remote ppoll request with zero timeout (just a readiness check).
+      int64_t use_ns = timeout_infinite ? slice_ns : slice_ns;
+      if (!timeout_infinite && remaining_ns < use_ns) use_ns = remaining_ns;
+      if (!timeout_infinite && use_ns < 0) use_ns = 0;
+
+      uint64_t use_sec = (uint64_t)(use_ns / 1000000000LL);
+      uint64_t use_nsec = (uint64_t)(use_ns % 1000000000LL);
+
       uint32_t req_len = 32 + (uint32_t)nfds * 16 + (has_sig ? (uint32_t)sigsz : 0);
       uint8_t *req = (uint8_t *)malloc(req_len);
       if (!req) die("malloc");
       rsys_put_u32(req + 0, (uint32_t)nfds);
-      rsys_put_u32(req + 4, 1u); // has_tmo
+      // If we have any local fds to multiplex with, we MUST use a finite remote timeout
+      // (a slice), even when the overall timeout is infinite, otherwise we can block
+      // forever in the remote ppoll() and miss local stdin readiness.
+      uint32_t req_has_tmo = (uint32_t)((!timeout_infinite || any_local) ? 1u : 0u);
+      rsys_put_u32(req + 4, req_has_tmo);
       rsys_put_u32(req + 8, has_sig);
       rsys_put_u32(req + 12, (uint32_t)sigsz);
-      rsys_put_s64(req + 16, 0);
-      rsys_put_s64(req + 24, 0);
+      rsys_put_s64(req + 16, (int64_t)use_sec);
+      rsys_put_s64(req + 24, (int64_t)use_nsec);
       uint32_t off = 32;
       for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
         int rfd = (pfds[i].fd < 0) ? -1 : map_fd(pfds[i].fd);
@@ -3415,42 +3283,31 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
         rsys_put_u32(req + off + 12, 0);
         off += 16;
       }
-      if (has_sig) {
-        memcpy(req + off, sigmask, (size_t)sigsz);
-      }
+      if (has_sig) memcpy(req + off, sigmask, (size_t)sigsz);
 
       struct rsys_resp resp;
       uint8_t *data = NULL;
       uint32_t data_len = 0;
-      int rcall_ok = (rsys_call(sock, RSYS_REQ_PPOLL, req, req_len, &resp, &data, &data_len) == 0);
+      int ok = (rsys_call(sock, RSYS_REQ_PPOLL, req, req_len, &resp, &data, &data_len) == 0);
       free(req);
 
-      int64_t rax_remote = rcall_ok ? raw_sys_ret(rsys_resp_raw_ret(&resp), rsys_resp_err_no(&resp)) : -EIO;
-      int any_ready = 0;
-      if (rcall_ok && rax_remote >= 0 && data_len == 4u + (uint32_t)nfds * 4u && rsys_get_u32(data + 0) == (uint32_t)nfds) {
-        for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
-          short rr = (short)(uint16_t)rsys_get_u32(data + 4 + i * 4);
-          pfds[i].revents = rr;
-        }
-      } else {
-        for (uint32_t i = 0; i < (uint32_t)nfds; i++) pfds[i].revents = 0;
+      for (uint32_t i = 0; i < (uint32_t)nfds; i++) pfds[i].revents = 0;
+      if (ok && rsys_resp_raw_ret(&resp) >= 0 && data_len == 4u + (uint32_t)nfds * 4u && rsys_get_u32(data + 0) == (uint32_t)nfds) {
+        for (uint32_t i = 0; i < (uint32_t)nfds; i++) pfds[i].revents = (short)(uint16_t)rsys_get_u32(data + 4 + i * 4);
       }
-      // Merge local revents back in (for local fds only).
-      if (lrc > 0) {
+      free(data);
+
+      if (lp) {
         for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
           if (lp[i].fd >= 0) pfds[i].revents |= lp[i].revents;
         }
+        free(lp);
       }
-      free(lp);
-      free(data);
 
-      for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
-        if (pfds[i].revents) any_ready = 1;
-      }
-      if (any_ready) {
-        // Count ready fds like poll does (number of fds with nonzero revents).
-        int ready_cnt = 0;
-        for (uint32_t i = 0; i < (uint32_t)nfds; i++) if (pfds[i].revents) ready_cnt++;
+      int ready_cnt = 0;
+      for (uint32_t i = 0; i < (uint32_t)nfds; i++) if (pfds[i].revents) ready_cnt++;
+
+      if (ready_cnt > 0 || (has_tmo && remaining_ns <= 0) || (!any_local)) {
         regs->orig_rax = __NR_getpid;
         if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
         pending_clear(pend);
@@ -3465,46 +3322,11 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
         return 1;
       }
 
-      if (!timeout_infinite && remaining_ns <= 0) {
-        regs->orig_rax = __NR_getpid;
-        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-        pending_clear(pend);
-        pend->active = 1;
-        pend->nr = nr;
-        pend->set_rax = 0;
-        free(pfds);
-        return 1;
+      if (has_tmo) {
+        remaining_ns -= use_ns;
+        if (remaining_ns <= 0) continue;
       }
-
-      // Block remotely for a small slice to wait for remote readiness.
-      int64_t slice_ns = 50 * 1000000LL;
-      if (!timeout_infinite && remaining_ns < slice_ns) slice_ns = remaining_ns;
-
-      uint64_t slice_sec = (uint64_t)(slice_ns / 1000000000LL);
-      uint64_t slice_nsec = (uint64_t)(slice_ns % 1000000000LL);
-
-      uint32_t req_len2 = 32 + (uint32_t)nfds * 16 + (has_sig ? (uint32_t)sigsz : 0);
-      uint8_t *req2 = (uint8_t *)malloc(req_len2);
-      if (!req2) die("malloc");
-      rsys_put_u32(req2 + 0, (uint32_t)nfds);
-      rsys_put_u32(req2 + 4, 1u);
-      rsys_put_u32(req2 + 8, has_sig);
-      rsys_put_u32(req2 + 12, (uint32_t)sigsz);
-      rsys_put_s64(req2 + 16, (int64_t)slice_sec);
-      rsys_put_s64(req2 + 24, (int64_t)slice_nsec);
-      off = 32;
-      for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
-        int rfd = (pfds[i].fd < 0) ? -1 : map_fd(pfds[i].fd);
-        rsys_put_s64(req2 + off + 0, (int64_t)rfd);
-        rsys_put_u32(req2 + off + 8, (uint32_t)(uint16_t)pfds[i].events);
-        rsys_put_u32(req2 + off + 12, 0);
-        off += 16;
-      }
-      if (has_sig) memcpy(req2 + off, sigmask, (size_t)sigsz);
-      (void)rsys_call(sock, RSYS_REQ_PPOLL, req2, req_len2, &resp, &data, &data_len);
-      free(req2);
-      free(data);
-      if (!timeout_infinite) remaining_ns -= slice_ns;
+      if (slice_ns < 500 * 1000000LL) slice_ns *= 2;
     }
   }
 
@@ -3524,45 +3346,56 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
       return 0;
     }
 
-    // Mixed local+remote poll: if any fd is remote-mapped, forward readiness
-    // checks for those fds to remote ppoll(), and check local fds via local poll().
     int any_remote = 0;
+    int any_local = 0;
     for (size_t i = 0; i < (size_t)nfds; i++) {
       if (pfds[i].fd < 0) continue;
-      if (map_fd(pfds[i].fd) >= 0) {
-        any_remote = 1;
-        break;
-      }
+      if (map_fd(pfds[i].fd) >= 0) any_remote = 1;
+      else any_local = 1;
     }
     if (!any_remote) {
       free(pfds);
-      return 0; // all-local: let kernel handle it
+      return 0;
     }
 
     int timeout_infinite = (timeout_ms < 0);
     int64_t remaining_ns = timeout_infinite ? -1 : (int64_t)timeout_ms * 1000000LL;
+    int64_t slice_ns = any_local ? (50 * 1000000LL) : remaining_ns;
 
     for (;;) {
-      // Local readiness check (mask out remote-mapped fds).
-      struct pollfd *lp = (struct pollfd *)malloc((size_t)nfds * sizeof(*lp));
-      if (!lp) die("malloc");
-      memcpy(lp, pfds, (size_t)nfds * sizeof(*lp));
-      for (size_t i = 0; i < (size_t)nfds; i++) {
-        if (lp[i].fd < 0) continue;
-        if (map_fd(lp[i].fd) >= 0) lp[i].fd = -1;
+      struct pollfd *lp = NULL;
+      if (any_local) {
+        lp = (struct pollfd *)malloc((size_t)nfds * sizeof(*lp));
+        if (!lp) die("malloc");
+        memcpy(lp, pfds, (size_t)nfds * sizeof(*lp));
+        for (size_t i = 0; i < (size_t)nfds; i++) {
+          if (lp[i].fd < 0) continue;
+          if (map_fd(lp[i].fd) >= 0) lp[i].fd = -1;
+          lp[i].revents = 0;
+        }
+        (void)poll(lp, (nfds_t)nfds, 0);
       }
-      (void)poll(lp, (nfds_t)nfds, 0);
 
-      // Remote readiness check via ppoll() with 0 timeout.
+      int64_t use_ns = timeout_infinite ? slice_ns : slice_ns;
+      if (!timeout_infinite && remaining_ns < use_ns) use_ns = remaining_ns;
+      if (!timeout_infinite && use_ns < 0) use_ns = 0;
+
+      uint64_t use_sec = (uint64_t)(use_ns / 1000000000LL);
+      uint64_t use_nsec = (uint64_t)(use_ns % 1000000000LL);
+
       uint32_t req_len = 32 + (uint32_t)nfds * 16;
       uint8_t *req = (uint8_t *)malloc(req_len);
       if (!req) die("malloc");
       rsys_put_u32(req + 0, (uint32_t)nfds);
-      rsys_put_u32(req + 4, 1u); // has_tmo
-      rsys_put_u32(req + 8, 0);  // has_sig
-      rsys_put_u32(req + 12, 0); // sigsetsize
-      rsys_put_s64(req + 16, 0);
-      rsys_put_s64(req + 24, 0);
+      // If we have any local fds to multiplex with, we MUST use a finite remote timeout
+      // (a slice), even when the overall timeout is infinite, otherwise we can block
+      // forever in the remote ppoll() and miss local readiness.
+      uint32_t req_has_tmo = (uint32_t)((!timeout_infinite || any_local) ? 1u : 0u);
+      rsys_put_u32(req + 4, req_has_tmo);
+      rsys_put_u32(req + 8, 0);
+      rsys_put_u32(req + 12, 0);
+      rsys_put_s64(req + 16, (int64_t)use_sec);
+      rsys_put_s64(req + 24, (int64_t)use_nsec);
       uint32_t off = 32;
       for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
         int rfd = (pfds[i].fd < 0) ? -1 : map_fd(pfds[i].fd);
@@ -3578,24 +3411,22 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
       int ok = (rsys_call(sock, RSYS_REQ_PPOLL, req, req_len, &resp, &data, &data_len) == 0);
       free(req);
 
-      // Merge remote revents
       for (uint32_t i = 0; i < (uint32_t)nfds; i++) pfds[i].revents = 0;
       if (ok && rsys_resp_raw_ret(&resp) >= 0 && data_len == 4u + (uint32_t)nfds * 4u && rsys_get_u32(data + 0) == (uint32_t)nfds) {
-        for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
-          pfds[i].revents = (short)(uint16_t)rsys_get_u32(data + 4 + i * 4);
-        }
+        for (uint32_t i = 0; i < (uint32_t)nfds; i++) pfds[i].revents = (short)(uint16_t)rsys_get_u32(data + 4 + i * 4);
       }
       free(data);
 
-      // Merge local revents for local fds
-      for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
-        if (lp[i].fd >= 0) pfds[i].revents |= lp[i].revents;
+      if (lp) {
+        for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
+          if (lp[i].fd >= 0) pfds[i].revents |= lp[i].revents;
+        }
+        free(lp);
       }
-      free(lp);
 
       int ready_cnt = 0;
       for (uint32_t i = 0; i < (uint32_t)nfds; i++) if (pfds[i].revents) ready_cnt++;
-      if (ready_cnt > 0 || timeout_ms == 0) {
+      if (ready_cnt > 0 || timeout_ms == 0 || (!any_local)) {
         regs->orig_rax = __NR_getpid;
         if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
         pending_clear(pend);
@@ -3610,44 +3441,24 @@ static int intercept_syscall(pid_t pid, struct user_regs_struct *regs, int sock,
         return 1;
       }
 
-      if (!timeout_infinite && remaining_ns <= 0) {
-        regs->orig_rax = __NR_getpid;
-        if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
-        pending_clear(pend);
-        pend->active = 1;
-        pend->nr = nr;
-        pend->set_rax = 0;
-        free(pfds);
-        return 1;
+      if (!timeout_infinite) {
+        remaining_ns -= use_ns;
+        if (remaining_ns <= 0) {
+          regs->orig_rax = __NR_getpid;
+          if (ptrace(PTRACE_SETREGS, pid, 0, regs) < 0) die("PTRACE_SETREGS");
+          pending_clear(pend);
+          pend->active = 1;
+          pend->nr = nr;
+          pend->set_rax = 0;
+          uint8_t *wb = (uint8_t *)malloc((size_t)nfds * sizeof(*pfds));
+          if (!wb) die("malloc");
+          memcpy(wb, pfds, (size_t)nfds * sizeof(*pfds));
+          (void)pending_add_out(pend, fds_addr, wb, (uint32_t)((size_t)nfds * sizeof(*pfds)));
+          free(pfds);
+          return 1;
+        }
       }
-
-      // Block remotely for a small slice, then re-check local fds too.
-      int64_t slice_ns = 50 * 1000000LL;
-      if (!timeout_infinite && remaining_ns < slice_ns) slice_ns = remaining_ns;
-      uint64_t slice_sec = (uint64_t)(slice_ns / 1000000000LL);
-      uint64_t slice_nsec = (uint64_t)(slice_ns % 1000000000LL);
-
-      uint32_t req_len2 = 32 + (uint32_t)nfds * 16;
-      uint8_t *req2 = (uint8_t *)malloc(req_len2);
-      if (!req2) die("malloc");
-      rsys_put_u32(req2 + 0, (uint32_t)nfds);
-      rsys_put_u32(req2 + 4, 1u);
-      rsys_put_u32(req2 + 8, 0);
-      rsys_put_u32(req2 + 12, 0);
-      rsys_put_s64(req2 + 16, (int64_t)slice_sec);
-      rsys_put_s64(req2 + 24, (int64_t)slice_nsec);
-      off = 32;
-      for (uint32_t i = 0; i < (uint32_t)nfds; i++) {
-        int rfd = (pfds[i].fd < 0) ? -1 : map_fd(pfds[i].fd);
-        rsys_put_s64(req2 + off + 0, (int64_t)rfd);
-        rsys_put_u32(req2 + off + 8, (uint32_t)(uint16_t)pfds[i].events);
-        rsys_put_u32(req2 + off + 12, 0);
-        off += 16;
-      }
-      (void)rsys_call(sock, RSYS_REQ_PPOLL, req2, req_len2, &resp, &data, &data_len);
-      free(req2);
-      free(data);
-      if (!timeout_infinite) remaining_ns -= slice_ns;
+      if (slice_ns < 500 * 1000000LL) slice_ns *= 2;
     }
   }
 
@@ -3658,6 +3469,16 @@ struct fd_table {
   struct fd_map map;
   uint32_t refs;
 };
+
+static void remote_close_best_effort(int sock, int remote_fd) {
+  uint8_t req[8];
+  rsys_put_s64(req + 0, (int64_t)remote_fd);
+  struct rsys_resp resp;
+  uint8_t *data = NULL;
+  uint32_t data_len = 0;
+  if (rsys_call(sock, RSYS_REQ_CLOSE, req, sizeof(req), &resp, &data, &data_len) < 0) return;
+  free(data);
+}
 
 static struct fd_table *fdtable_new(void) {
   struct fd_table *t = (struct fd_table *)calloc(1, sizeof(*t));
@@ -3931,24 +3752,42 @@ int main(int argc, char **argv) {
             }
           }
 
-          if (ps->pend.map_fd_on_exit) {
+          // If we created placeholder FD(s), map them to remote FD(s) on syscall exit.
+          if (ps->pend.map_fd_on_exit && (int64_t)regs.rax >= 0) {
             int local_fd = (int)regs.rax;
             int remote_fd = ps->pend.map_remote_fd;
-            if (local_fd >= 0) {
-              if (fdmap_add_existing(&ps->fdt->map, &rr, local_fd, remote_fd) < 0) {
-                // Can't track refs/mapping: close remote best-effort and turn into ENOMEM.
-                remote_close_best_effort(sock, remote_fd);
-                regs.rax = (uint64_t)(-(int64_t)ENOMEM);
-              }
-            } else {
-              // Local placeholder allocation failed; close remote best-effort.
+            if (fdmap_add_existing(&ps->fdt->map, &rr, local_fd, remote_fd) < 0) {
               remote_close_best_effort(sock, remote_fd);
+              regs.rax = (uint64_t)(-(int64_t)ENOMEM);
+              ps->pend.has_set_rax = 1;
+              ps->pend.set_rax = -(int64_t)ENOMEM;
             }
           }
 
-          if (ps->pend.has_set_rax) {
-            regs.rax = (uint64_t)ps->pend.set_rax;
+          if (ps->pend.map_fd_pair_on_exit && (int64_t)regs.rax >= 0) {
+            int32_t sv[2] = {-1, -1};
+            if (ps->pend.map_pair_addr) {
+              (void)rsys_read_mem(pid, sv, (uintptr_t)ps->pend.map_pair_addr, sizeof(sv));
+              if (sv[0] >= 0) {
+                if (fdmap_add_existing(&ps->fdt->map, &rr, sv[0], ps->pend.map_remote_fd0) < 0) {
+                  remote_close_best_effort(sock, ps->pend.map_remote_fd0);
+                  ps->pend.has_set_rax = 1;
+                  ps->pend.set_rax = -(int64_t)ENOMEM;
+                  regs.rax = (uint64_t)ps->pend.set_rax;
+                }
+              }
+              if (sv[1] >= 0) {
+                if (fdmap_add_existing(&ps->fdt->map, &rr, sv[1], ps->pend.map_remote_fd1) < 0) {
+                  remote_close_best_effort(sock, ps->pend.map_remote_fd1);
+                  ps->pend.has_set_rax = 1;
+                  ps->pend.set_rax = -(int64_t)ENOMEM;
+                  regs.rax = (uint64_t)ps->pend.set_rax;
+                }
+              }
+            }
           }
+
+          if (ps->pend.has_set_rax) regs.rax = (uint64_t)ps->pend.set_rax;
           if (ptrace(PTRACE_SETREGS, pid, 0, &regs) < 0) die("PTRACE_SETREGS");
           pending_clear(&ps->pend);
         }
